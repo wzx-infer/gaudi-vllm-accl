@@ -42,8 +42,8 @@ dev = [
 gaudi_vllm_accl = "gaudi_vllm_accl.register:register"
 
 [project.urls]
-Homepage = "https://github.com/your-username/gaudi-vllm-accl"
-Repository = "https://github.com/your-username/gaudi-vllm-accl"
+Homepage = "https://github.com/wzx-infer/gaudi-vllm-accl"
+Repository = "https://github.com/wzx-infer/gaudi-vllm-accl"
 
 [tool.setuptools.packages.find]
 where = ["src"]
