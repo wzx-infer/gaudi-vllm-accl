@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaudi-vllm-accl"
+version = "0.1.0"
+description = "Lightweight vLLM plugin for Intel Gaudi: model support and acceleration features"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Wang Zhixiong", email = "wangzhixiong@example.com"}
+]
+keywords = ["vllm", "gaudi", "llm", "inference", "acceleration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "vllm>=0.6.0",
+    # TODO: Add vllm-gaudi package when available on PyPI
+    # "vllm-gaudi",  # Uncomment if upstream vLLM-Gaudi provides a pip package
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "mypy",
+]
+
+[project.entry-points."vllm.general_plugins"]
+gaudi_vllm_accl = "gaudi_vllm_accl.register:register"
+
+[project.urls]
+Homepage = "https://github.com/your-username/gaudi-vllm-accl"
+Repository = "https://github.com/your-username/gaudi-vllm-accl"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gaudi_vllm_accl = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
