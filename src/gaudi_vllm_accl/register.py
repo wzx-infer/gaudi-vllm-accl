@@ -103,22 +103,15 @@ def _register_models() -> None:
 
     # Register DeepSeek V4.1 Flash model
     try:
-        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41FlashForCausalLM
+        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepseekV41ForCausalLM
 
         ModelRegistry.register_model(
-            "DeepSeekV41FlashForCausalLM",
-            DeepSeekV41FlashForCausalLM
+            "DeepseekV41ForCausalLM",
+            DeepseekV41ForCausalLM
         )
-        logger.info("Registered model: DeepSeekV41FlashForCausalLM")
+        logger.info("Registered model: DeepseekV41ForCausalLM")
     except Exception as e:
-        logger.error(f"Failed to register DeepSeekV41FlashForCausalLM: {e}")
-
-    # TODO: Add more model registrations here as needed
-    # Example:
-    # ModelRegistry.register_model(
-    #     "AnotherModelForCausalLM",
-    #     AnotherModelForCausalLM
-    # )
+        logger.error(f"Failed to register DeepseekV41ForCausalLM: {e}")
 
 
 def _register_accel() -> None:
@@ -135,12 +128,4 @@ def _register_accel() -> None:
     - Optimized MoE routing and expert parallelism
     - Kernel fusion optimizations
     """
-    # TODO: Implement acceleration feature registration
-    # This will depend on vLLM's extension points for custom kernels/layers
-
     logger.info("Acceleration features registration: not yet implemented")
-
-    # Placeholder for future implementation:
-    # - Register custom attention via vLLM's attention backend system
-    # - Register MoE optimizations via layer replacement hooks
-    # - Do NOT monkey-patch upstream vLLM-Gaudi code
