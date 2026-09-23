@@ -9,8 +9,54 @@ It registers:
 
 from typing import Optional
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
+
+# Required vLLM version
+REQUIRED_VLLM_VERSION = "0.26.0"
+
+
+def _check_vllm_version() -> None:
+    """
+    Verify that the correct vLLM version is installed.
+
+    Raises:
+        ImportError: If vLLM is not installed
+        RuntimeError: If vLLM version doesn't match required version
+    """
+    try:
+        import vllm
+    except ImportError as e:
+        raise ImportError(
+            f"vLLM is not installed. This plugin requires vLLM {REQUIRED_VLLM_VERSION} "
+            f"or vllm-gaudi {REQUIRED_VLLM_VERSION}. "
+            f"Please install the correct version before loading this plugin."
+        ) from e
+
+    installed_version = getattr(vllm, "__version__", None)
+
+    if installed_version is None:
+        logger.warning(
+            "Could not determine vLLM version. "
+            f"This plugin is designed for vLLM {REQUIRED_VLLM_VERSION}. "
+            "Compatibility is not guaranteed."
+        )
+        return
+
+    if installed_version != REQUIRED_VLLM_VERSION:
+        raise RuntimeError(
+            f"vLLM version mismatch!\n"
+            f"  Required: {REQUIRED_VLLM_VERSION}\n"
+            f"  Installed: {installed_version}\n"
+            f"This plugin is specifically designed for vLLM {REQUIRED_VLLM_VERSION} "
+            f"(or vllm-gaudi {REQUIRED_VLLM_VERSION}). "
+            f"Using a different version may cause API incompatibilities or runtime errors.\n"
+            f"Please install the correct version:\n"
+            f"  pip install vllm-gaudi=={REQUIRED_VLLM_VERSION}"
+        )
+
+    logger.info(f"vLLM version check passed: {installed_version}")
 
 
 def register() -> None:
@@ -19,8 +65,15 @@ def register() -> None:
 
     This function is invoked automatically when vLLM loads general plugins.
     It registers all models and acceleration features provided by this package.
+
+    Raises:
+        ImportError: If vLLM is not installed
+        RuntimeError: If vLLM version doesn't match required version
     """
     logger.info("Registering gaudi-vllm-accl plugin...")
+
+    # Step 0: Verify vLLM version before any registration
+    _check_vllm_version()
 
     # Part A: Register new models
     _register_models()

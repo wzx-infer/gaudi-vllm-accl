@@ -23,19 +23,19 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
 ]
 
-dependencies = [
-    "vllm>=0.6.0",
-    # TODO: Add vllm-gaudi package when available on PyPI
-    # "vllm-gaudi",  # Uncomment if upstream vLLM-Gaudi provides a pip package
-]
+dependencies = []
 
 [project.optional-dependencies]
+# 可选依赖：用于文档说明，不会在安装时强制执行
+gaudi = ["vllm-gaudi==0.26.0"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio",
-    "black",
+    "pytest-cov>=4.0",
+    "black>=23.0",
     "isort",
     "mypy",
+    "ruff>=0.1.0",
 ]
 
 [project.entry-points."vllm.general_plugins"]

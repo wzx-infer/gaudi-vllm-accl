@@ -1,0 +1,39 @@
+{
+  "vllm_version": null,
+  "modelregistry": {
+    "module_path": null,
+    "register_model_signature": null,
+    "supported_archs": [],
+    "additional_methods": []
+  },
+  "plugin_system": {
+    "has_plugin_loader": false,
+    "entry_points_supported": [],
+    "plugin_module_path": null
+  },
+  "attention": {
+    "module_path": null,
+    "init_signature": null,
+    "forward_signature": null,
+    "attention_backend": null
+  },
+  "attention_metadata": {
+    "module_path": null,
+    "fields": []
+  },
+  "parallel_layers": {
+    "ColumnParallelLinear": null,
+    "RowParallelLinear": null,
+    "VocabParallelEmbedding": null,
+    "QKVParallelLinear": null
+  },
+  "moe_support": {
+    "fused_moe": null,
+    "moe_layer": null,
+    "moe_related_modules": []
+  },
+  "kv_cache_config": {
+    "module_path": null,
+    "fields": []
+  }
+}

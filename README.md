@@ -33,13 +33,35 @@ This package **does not** fork or copy upstream vLLM-Gaudi. Instead, it uses vLL
 
 ## Installation
 
-```bash
-# Install from source (development)
-pip install -e .
+### Prerequisites
 
-# With dev dependencies
-pip install -e ".[dev]"
+- **vllm-gaudi 0.26.0** must be pre-installed (typically on Intel Gaudi clusters)
+- Python >= 3.9
+
+### Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/wzx-infer/gaudi-vllm-accl.git
+cd gaudi-vllm-accl
+
+# Install plugin (no dependency downloads)
+pip install -e . --no-deps
+
+# Verify installation
+python -c "from gaudi_vllm_accl.register import register; register()"
 ```
+
+**Why `--no-deps`?** This plugin relies on the pre-installed `vllm-gaudi==0.26.0` in your environment. The `--no-deps` flag prevents pip from attempting to download incompatible vLLM versions.
+
+For detailed installation instructions and troubleshooting, see [docs/INSTALLATION.md](docs/INSTALLATION.md).
+
+### Version Requirements
+
+- ✅ **Supported**: vllm-gaudi 0.26.0
+- ❌ **Not compatible**: vllm >= 0.6.0 (API differences)
+
+The plugin performs strict version checking at runtime and will raise a clear error if the version doesn't match.
 
 ## Usage
 
