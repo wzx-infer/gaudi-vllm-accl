@@ -6,6 +6,9 @@ It registers:
 1. Transformers config (so vLLM can load the config)
 2. New model architectures (e.g., DeepSeek V4.1 Flash)
 3. Acceleration features (attention, MoE optimizations)
+
+Note: vLLM 0.26.0 already has built-in DeepSeek V4.1 tokenizer support,
+so we don't need to register it separately.
 """
 
 from typing import Optional
@@ -61,10 +64,7 @@ def register() -> None:
     # Part B: Register new models
     _register_models()
 
-    # Part C: Register tokenizers
-    _register_tokenizers()
-
-    # Part D: Register acceleration features
+    # Part C: Register acceleration features
     _register_accel()
 
     logger.info("gaudi-vllm-accl plugin registered successfully.")
@@ -110,21 +110,6 @@ def _register_models() -> None:
         logger.info("Registered model: DeepseekV41ForCausalLM")
     except Exception as e:
         logger.error(f"Failed to register DeepseekV41ForCausalLM: {e}")
-
-
-def _register_tokenizers() -> None:
-    """Register custom tokenizers with vLLM."""
-    try:
-        from vllm.tokenizers import TokenizerRegistry
-
-        # Register DeepSeek V4.1 tokenizer using string path format
-        TokenizerRegistry.register(
-            "deepseek_v41",
-            "gaudi_vllm_accl.tokenizers.deepseek_v41:DeepseekV41Tokenizer"
-        )
-        logger.info("Registered DeepSeek V4.1 tokenizer")
-    except Exception as e:
-        logger.warning(f"Failed to register tokenizer: {e}")
 
 
 def _register_accel() -> None:
