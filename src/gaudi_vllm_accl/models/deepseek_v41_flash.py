@@ -124,8 +124,12 @@ class DeepSeekV41Config(PretrainedConfig):
         if hasattr(self, 'text_config'):
             delattr(self, 'text_config')
 
-    def get_text_config(self):
-        """Return self as the text config since we've already flattened the attributes."""
+    def get_text_config(self, **kwargs):
+        """Return self as the text config since we've already flattened the attributes.
+
+        Args:
+            **kwargs: Accept any keyword arguments (like decoder=True) for compatibility
+        """
         return self
 
     @classmethod
