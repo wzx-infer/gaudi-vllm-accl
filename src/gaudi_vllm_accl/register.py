@@ -61,7 +61,10 @@ def register() -> None:
     # Part B: Register new models
     _register_models()
 
-    # Part C: Register acceleration features
+    # Part C: Register tokenizers
+    _register_tokenizers()
+
+    # Part D: Register acceleration features
     _register_accel()
 
     logger.info("gaudi-vllm-accl plugin registered successfully.")
@@ -107,6 +110,22 @@ def _register_models() -> None:
         logger.info("Registered model: DeepseekV41ForCausalLM")
     except Exception as e:
         logger.error(f"Failed to register DeepseekV41ForCausalLM: {e}")
+
+
+def _register_tokenizers() -> None:
+    """Register custom tokenizers with vLLM."""
+    try:
+        from vllm.tokenizers import TokenizerRegistry
+        from gaudi_vllm_accl.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
+
+        # Register DeepSeek V4.1 tokenizer
+        TokenizerRegistry.register_tokenizer(
+            "deepseek_v41",
+            DeepseekV41Tokenizer
+        )
+        logger.info("Registered DeepSeek V4.1 tokenizer")
+    except Exception as e:
+        logger.warning(f"Failed to register tokenizer: {e}")
 
 
 def _register_accel() -> None:
