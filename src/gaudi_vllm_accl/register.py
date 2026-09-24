@@ -99,11 +99,10 @@ def _register_models() -> None:
 
     # Register DeepSeek V4.1 Flash model
     try:
-        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepseekV41ForCausalLM
-
+        # Use string format to avoid CUDA initialization on import
         ModelRegistry.register_model(
             "DeepseekV41ForCausalLM",
-            DeepseekV41ForCausalLM
+            "gaudi_vllm_accl.models.gaudi.model:DeepseekV41ForCausalLM"
         )
         logger.info("Registered model: DeepseekV41ForCausalLM")
     except Exception as e:
