@@ -65,8 +65,32 @@ class DeepSeekV41Config(PretrainedConfig):
         engram_layer_ids=None,
         # DSpark
         dspark_target_layer_ids=None,
+        text_config=None,
         **kwargs,
     ):
+        # If text_config is provided, extract attributes from it
+        if text_config is not None:
+            if isinstance(text_config, dict):
+                vocab_size = text_config.get('vocab_size', vocab_size)
+                hidden_size = text_config.get('hidden_size', hidden_size)
+                num_hidden_layers = text_config.get('num_hidden_layers', num_hidden_layers)
+                num_attention_heads = text_config.get('num_attention_heads', num_attention_heads)
+                num_key_value_heads = text_config.get('num_key_value_heads', num_key_value_heads)
+                head_dim = text_config.get('head_dim', head_dim)
+                moe_intermediate_size = text_config.get('moe_intermediate_size', moe_intermediate_size)
+                n_routed_experts = text_config.get('n_routed_experts', n_routed_experts)
+                n_shared_experts = text_config.get('n_shared_experts', n_shared_experts)
+                num_experts_per_tok = text_config.get('num_experts_per_tok', num_experts_per_tok)
+                max_position_embeddings = text_config.get('max_position_embeddings', max_position_embeddings)
+                rope_theta = text_config.get('rope_theta', rope_theta)
+                rms_norm_eps = text_config.get('rms_norm_eps', rms_norm_eps)
+                q_lora_rank = text_config.get('q_lora_rank', q_lora_rank)
+                qk_rope_head_dim = text_config.get('qk_rope_head_dim', qk_rope_head_dim)
+                compress_ratios = text_config.get('compress_ratios', compress_ratios)
+                kv_source_layer_ids = text_config.get('kv_source_layer_ids', kv_source_layer_ids)
+                engram_layer_ids = text_config.get('engram_layer_ids', engram_layer_ids)
+                dspark_target_layer_ids = text_config.get('dspark_target_layer_ids', dspark_target_layer_ids)
+
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -95,6 +119,14 @@ class DeepSeekV41Config(PretrainedConfig):
         self.dspark_target_layer_ids = dspark_target_layer_ids or []
 
         super().__init__(**kwargs)
+
+        # Remove text_config attribute to ensure get_text_config() returns self
+        if hasattr(self, 'text_config'):
+            delattr(self, 'text_config')
+
+    def get_text_config(self):
+        """Return self as the text config since we've already flattened the attributes."""
+        return self
 
     @classmethod
     def from_pretrained_config(cls, config: PretrainedConfig):
