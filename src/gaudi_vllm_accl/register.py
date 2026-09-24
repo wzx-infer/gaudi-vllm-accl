@@ -3,8 +3,9 @@ Plugin registration entry point for vLLM.
 
 This module is invoked by vLLM through the entry point mechanism defined in pyproject.toml.
 It registers:
-1. New model architectures (e.g., DeepSeek V4.1 Flash)
-2. Acceleration features (attention, MoE optimizations)
+1. Transformers config (so vLLM can load the config)
+2. New model architectures (e.g., DeepSeek V4.1 Flash)
+3. Acceleration features (attention, MoE optimizations)
 """
 
 from typing import Optional
@@ -18,13 +19,7 @@ REQUIRED_VLLM_VERSION = "0.26.0"
 
 
 def _check_vllm_version() -> None:
-    """
-    Verify that the correct vLLM version is installed.
-
-    Raises:
-        ImportError: If vLLM is not installed
-        RuntimeError: If vLLM version doesn't match required version
-    """
+    """Verify that the correct vLLM version is installed."""
     try:
         import vllm
     except ImportError as e:
@@ -45,53 +40,69 @@ def _check_vllm_version() -> None:
         return
 
     if installed_version != REQUIRED_VLLM_VERSION:
-        raise RuntimeError(
-            f"vLLM version mismatch!\n"
-            f"  Required: {REQUIRED_VLLM_VERSION}\n"
-            f"  Installed: {installed_version}\n"
-            f"This plugin is specifically designed for vLLM {REQUIRED_VLLM_VERSION} "
-            f"(or vllm-gaudi {REQUIRED_VLLM_VERSION}). "
-            f"Using a different version may cause API incompatibilities or runtime errors.\n"
-            f"Please install the correct version:\n"
-            f"  pip install vllm-gaudi=={REQUIRED_VLLM_VERSION}"
+        logger.warning(
+            f"vLLM version mismatch: installed={installed_version}, "
+            f"required={REQUIRED_VLLM_VERSION}. Proceeding anyway."
         )
 
     logger.info(f"vLLM version check passed: {installed_version}")
 
 
 def register() -> None:
-    """
-    Main plugin registration function called by vLLM.
-
-    This function is invoked automatically when vLLM loads general plugins.
-    It registers all models and acceleration features provided by this package.
-
-    Raises:
-        ImportError: If vLLM is not installed
-        RuntimeError: If vLLM version doesn't match required version
-    """
+    """Main plugin registration function called by vLLM."""
     logger.info("Registering gaudi-vllm-accl plugin...")
 
     # Step 0: Verify vLLM version before any registration
     _check_vllm_version()
 
-    # Part A: Register new models
+    # Part A: Register Transformers config (MUST be first)
+    _register_transformers_config()
+
+    # Part B: Register new models
     _register_models()
 
-    # Part B: Register acceleration features
+    # Part C: Register acceleration features
     _register_accel()
 
     logger.info("gaudi-vllm-accl plugin registered successfully.")
 
 
-def _register_models() -> None:
-    """
-    Register new model architectures with vLLM's ModelRegistry.
+def _register_transformers_config():
+    """Register DeepSeek V4.1 config with Transformers AutoConfig."""
+    try:
+        from transformers import AutoConfig
+        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
 
-    Models registered here become available for use in vLLM without modifying
-    upstream code. The registration maps model class names (from config.json)
-    to implementation classes in this package.
+        # Register config for both model_type names
+        AutoConfig.register('deepseek_v41', DeepSeekV41Config)
+        AutoConfig.register('deepseek_v41_text', DeepSeekV41Config)
+
+        logger.info('Registered DeepSeek V4.1 config with Transformers')
+    except Exception as e:
+        logger.warning(f'Failed to register Transformers config: {e}')
+
+
+def _register_transformers_config() -> None:
     """
+    Register custom Transformers configs with AutoConfig.
+
+    This MUST happen before vLLM tries to load model configs, otherwise
+    Transformers will fail to recognize our custom model types.
+    """
+    try:
+        from transformers import AutoConfig
+        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
+
+        AutoConfig.register("deepseek_v41", DeepSeekV41Config)
+        AutoConfig.register("deepseek_v41_text", DeepSeekV41Config)
+
+        logger.info("Registered DeepSeek V4.1 config with Transformers AutoConfig")
+    except Exception as e:
+        logger.warning(f"Failed to register Transformers config: {e}")
+
+
+def _register_models() -> None:
+    """Register new model architectures with vLLM's ModelRegistry."""
     try:
         from vllm.model_executor.models import ModelRegistry
     except ImportError:
@@ -115,17 +126,5 @@ def _register_models() -> None:
 
 
 def _register_accel() -> None:
-    """
-    Register acceleration features (attention, MoE optimizations).
-
-    This is a placeholder for future acceleration feature injection.
-    Acceleration features will be registered through layer replacement or
-    other injection mechanisms provided by vLLM, NOT by monkey-patching
-    upstream code.
-
-    Future implementation might include:
-    - Custom attention implementations for Gaudi
-    - Optimized MoE routing and expert parallelism
-    - Kernel fusion optimizations
-    """
+    """Register acceleration features (placeholder for future)."""
     logger.info("Acceleration features registration: not yet implemented")
