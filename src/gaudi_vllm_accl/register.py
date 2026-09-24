@@ -85,7 +85,6 @@ def _register_transformers_config() -> None:
         from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
 
         AutoConfig.register("deepseek_v41", DeepSeekV41Config)
-        AutoConfig.register("deepseek_v41_text", DeepSeekV41Config)
 
         logger.info("Registered DeepSeek V4.1 config with Transformers AutoConfig")
     except Exception as e:
@@ -118,7 +117,7 @@ def _register_models() -> None:
 def _register_tokenizers() -> None:
     """Register custom tokenizers with vLLM's TokenizerRegistry."""
     try:
-        from vllm.transformers_utils.tokenizer import TokenizerRegistry
+        from vllm.tokenizers.registry import TokenizerRegistry
         from gaudi_vllm_accl.tokenizers import DeepseekV41Tokenizer
 
         TokenizerRegistry.register(
