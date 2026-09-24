@@ -67,21 +67,6 @@ def register() -> None:
     logger.info("gaudi-vllm-accl plugin registered successfully.")
 
 
-def _register_transformers_config():
-    """Register DeepSeek V4.1 config with Transformers AutoConfig."""
-    try:
-        from transformers import AutoConfig
-        from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
-
-        # Register config for both model_type names
-        AutoConfig.register('deepseek_v41', DeepSeekV41Config)
-        AutoConfig.register('deepseek_v41_text', DeepSeekV41Config)
-
-        logger.info('Registered DeepSeek V4.1 config with Transformers')
-    except Exception as e:
-        logger.warning(f'Failed to register Transformers config: {e}')
-
-
 def _register_transformers_config() -> None:
     """
     Register custom Transformers configs with AutoConfig.
