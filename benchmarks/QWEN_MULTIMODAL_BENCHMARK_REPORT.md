@@ -4,7 +4,7 @@
 **模型**: Qwen/Qwen3.8-27B  
 **硬件**: 8x Gaudi2 (HL-225)  
 **vLLM 版本**: 0.26.0  
-**测试工具**: evalscope perf, curl benchmark  
+**测试工具**: evalscope perf (统一测试框架)  
 
 ---
 
@@ -51,16 +51,20 @@
 
 ## 测试场景
 
-### 场景 1: 纯文本推理（使用 curl）
-- **工具**: curl 批量请求
-- **数据集**: 固定文本提示词
+### 统一测试方法（evalscope perf）
+
+**关键改进**: 两个场景均使用 evalscope 进行压测，确保测试方法的一致性和可比性。
+
+### 场景 1: 纯文本推理
+- **工具**: evalscope perf
+- **数据集**: `random`（随机生成纯文本）
 - **并发度**: 16
 - **请求数**: 100
-- **输入**: "Explain the concept of machine learning in simple terms. Machine learning is"
+- **输入长度**: 512 tokens
 - **输出长度**: 最多 256 tokens
 - **温度**: 0.0（确定性生成）
 
-### 场景 2: 多模态推理（使用 evalscope）
+### 场景 2: 多模态推理
 - **工具**: evalscope perf
 - **数据集**: `random_vl`（随机生成图像+文本）
 - **并发度**: 16
@@ -73,17 +77,38 @@
 
 ## 测试结果
 
-### 场景 1: 纯文本推理对比
+### 场景 1: 纯文本推理（evalscope random 数据集）
 
-| 服务 | 端口 | 设备 | 完成时间 | 请求吞吐率 | 差异 |
-|------|------|------|----------|------------|------|
-| 服务 A | 8000 | 0-3 | 73.13 秒 | 1.36 req/s | 基准 |
-| 服务 B | 8001 | 4-7 | 70.85 秒 | 1.41 req/s | +3.7% |
+**测试配置**：
+- 服务: 端口 8000（设备 0-3）
+- 数据集: random（纯文本）
+- 输入长度: 512 tokens
 
-**关键发现**：
-- 两个服务性能几乎完全一致，差异在 **±4%** 以内
-- 设备 0-3 和设备 4-7 性能均衡
-- 纯文本场景下平均吞吐率: **1.38 req/s**
+#### 核心指标
+
+| 指标 | 数值 |
+|------|------|
+| Test Duration (s) | 68.87 |
+| Total Requests | 100 |
+| Success Rate | 100% |
+| **Request Throughput (req/s)** | **1.45** |
+| **Output Throughput (tok/s)** | **358.23** |
+| **Total Throughput (tok/s)** | **1102.34** |
+| Avg Latency (s) | 10.22 |
+| Avg TTFT (ms) | 655.81 |
+| Avg TPOT (ms) | 38.91 |
+| Avg ITL (ms) | 38.92 |
+| Avg Input Tokens | 512.4 |
+| Avg Output Tokens | 246.7 |
+
+#### 延迟分位数
+
+| 指标 | min | p50 | p90 | p99 | max |
+|------|-----|-----|-----|-----|-----|
+| Latency (s) | 6.65 | 10.60 | 11.17 | 11.37 | 11.37 |
+| TTFT (ms) | 170.76 | 416.09 | 1616.03 | 2450.29 | 2450.55 |
+| TPOT (ms) | 33.60 | 39.38 | 41.22 | 42.17 | 42.88 |
+| ITL (ms) | 0 | 32.90 | 40.64 | 160.40 | 794.21 |
 
 ### 场景 2: 多模态推理性能
 
@@ -134,36 +159,38 @@
 
 | 场景 | 服务 | 端口 | 输入类型 | 请求吞吐率 | 输出吞吐率 | 性能差异 |
 |------|------|------|----------|------------|------------|----------|
-| 纯文本 | A | 8000 | 文本 | 1.36 req/s | N/A | 基准 |
-| 纯文本 | B | 8001 | 文本 | 1.41 req/s | N/A | +3.7% |
-| **纯文本平均** | **-** | **-** | **文本** | **1.385 req/s** | **N/A** | **基准** |
-| **多模态** | **B** | **8001** | **文本+图像** | **1.24 req/s** | **318.67 tok/s** | **-10.5%** |
+| **纯文本** | **A** | **8000** | **文本** | **1.45 req/s** | **358.23 tok/s** | **基准** |
+| **多模态** | **B** | **8001** | **文本+图像** | **1.24 req/s** | **318.67 tok/s** | **-14.5%** |
 
-**核心结论**：相比纯文本场景（1.385 req/s），多模态图像处理场景（1.24 req/s）性能下降约 **10.5%**
+**核心结论**：相比纯文本场景（1.45 req/s），多模态图像处理场景（1.24 req/s）性能下降约 **14.5%**
 
 ### 关键发现
 
-#### 1. 纯文本性能一致性
-- 两组 Gaudi2 设备（0-3 和 4-7）性能完全均衡
-- 相同配置下的服务性能差异 < 4%
-- 平均请求吞吐率: **1.38 req/s**
+#### 1. 统一测试方法的重要性
+- 使用相同的 evalscope 工具和参数进行测试，确保对比的公平性
+- 唯一差异：数据集（random vs random_vl）
 
 #### 2. 多模态性能开销
-- 多模态推理（1.24 req/s）相比纯文本（1.38 req/s）慢约 **10%**
+- 多模态推理（1.24 req/s）相比纯文本（1.45 req/s）慢约 **14.5%**
 - 主要开销来源：
-  - **图像编码**: 平均 TTFT 为 1765 ms，明显高于纯文本场景
+  - **图像编码**: 平均 TTFT 为 1765 ms，而纯文本为 656 ms
   - **Vision Encoder 处理**: 512x512 RGB 图像需要额外的视觉特征提取
   - **多模态融合**: 图像特征与文本特征的融合计算
 
 #### 3. 文本生成性能稳定
-- 输出 token 吞吐率 (318.67 tok/s) 保持稳定
-- TPOT (39.32 ms) 与纯文本场景相近
+- 输出 token 吞吐率对比：
+  - 纯文本: 358.23 tok/s
+  - 多模态: 318.67 tok/s（-11.0%）
+- TPOT 几乎相同：
+  - 纯文本: 38.91 ms
+  - 多模态: 39.32 ms（+1.1%）
 - 说明在完成图像编码后，文本生成阶段性能不受影响
 
 #### 4. 首字延迟 (TTFT) 分析
-- **纯文本场景**: 预计 < 500 ms（基于 TPOT 推算）
-- **多模态场景**: 1765 ms（中位数 1405 ms）
-- **差异原因**: 图像编码和视觉特征提取增加了前置处理时间
+- **纯文本场景**: 655.81 ms（P50: 416 ms）
+- **多模态场景**: 1765.39 ms（P50: 1406 ms）
+- **差异**: +1109.58 ms（+169.2%）
+- **原因**: 图像编码和视觉特征提取增加了前置处理时间
 
 #### 5. 延迟稳定性
 - **P50-P90 延迟稳定**: 11.33s → 14.66s（变化 29%）
@@ -175,7 +202,7 @@
 ## 性能瓶颈分析
 
 ### 1. 多模态推理瓶颈
-**现象**: 多模态场景比纯文本慢 10%
+**现象**: 多模态场景比纯文本慢 14.5%
 
 **原因**:
 - 图像编码器（Vision Encoder）需要处理 512x512 = 262,144 像素
@@ -183,8 +210,8 @@
 - 多模态融合层的额外计算
 
 **影响**:
-- TTFT 增加: +1200ms（从 ~500ms 增加到 1765ms）
-- 请求吞吐率下降: 10%
+- TTFT 增加: +1109.58ms（从 655.81ms 增加到 1765.39ms，+169.2%）
+- 请求吞吐率下降: 14.5%
 
 ### 2. 首字延迟（TTFT）瓶颈
 **现象**: P99 TTFT 高达 5815 ms
@@ -260,21 +287,39 @@
 ## 附录
 
 ### 测试文件位置
-- 多模态测试日志: `/tmp/multimodal_vl_benchmark.log`
-- evalscope 输出: `/home/wzx/outputs/20260924_142905/mm1/`
+
+**纯文本测试**:
+- 日志: `/tmp/text_evalscope_benchmark.log`
+- 输出目录: `/home/wzx/outputs/20260924_160327/text/`
+- HTML 报告: `/home/wzx/outputs/20260924_160327/text/perf_report.html`
+
+**多模态测试**:
+- 日志: `/tmp/multimodal_vl_benchmark.log`
+- 输出目录: `/home/wzx/outputs/20260924_142905/mm1/`
 - HTML 报告: `/home/wzx/outputs/20260924_142905/mm1/perf_report.html`
 - 数据库: `/home/wzx/outputs/20260924_142905/mm1/parallel_16_number_100/benchmark_data.db`
 
 ### 测试命令参考
 
-#### 纯文本压测
+#### 纯文本压测（evalscope random 数据集）
 ```bash
-seq 1 100 | xargs -P 16 -I {} curl -s -X POST http://localhost:8001/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "mm1", "prompt": "Explain machine learning...", "max_tokens": 256, "temperature": 0.0}'
+python3 -m evalscope.perf.main \
+  --url "http://localhost:8000/v1/chat/completions" \
+  --model text \
+  --api openai \
+  --dataset random \
+  --parallel 16 \
+  --number 100 \
+  --min-prompt-length 512 \
+  --max-prompt-length 512 \
+  --max-tokens 256 \
+  --temperature 0.0 \
+  --tokenizer-path /data/models/Qwen/Qwen3.8-27B \
+  --log-every-n-query 10 \
+  --read-timeout 120
 ```
 
-#### 多模态压测
+#### 多模态压测（evalscope random_vl 数据集）
 ```bash
 python3 -m evalscope.perf.main \
   --url "http://localhost:8001/v1/chat/completions" \
@@ -290,7 +335,10 @@ python3 -m evalscope.perf.main \
   --image-format RGB \
   --image-num 1 \
   --max-tokens 256 \
-  --tokenizer-path /data/models/Qwen/Qwen3.8-27B
+  --temperature 0.0 \
+  --tokenizer-path /data/models/Qwen/Qwen3.8-27B \
+  --log-every-n-query 10 \
+  --read-timeout 120
 ```
 
 ### 环境信息
