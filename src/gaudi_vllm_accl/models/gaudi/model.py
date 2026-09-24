@@ -29,8 +29,11 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     make_layers,
     PPMissingLayer,
+    maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+
+from ..interfaces import SupportsPP
 
 logger = init_logger(__name__)
 
@@ -243,6 +246,10 @@ class DeepseekV41Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed input token IDs."""
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -274,8 +281,22 @@ class DeepseekV41Model(nn.Module):
 
         return hidden_states
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors({
+            "hidden_states": torch.zeros(
+                (batch_size, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+        })
 
-class DeepseekV41ForCausalLM(nn.Module):
+
+class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
     """
     DeepSeek V4.1 Flash model for causal LM.
 
@@ -283,19 +304,16 @@ class DeepseekV41ForCausalLM(nn.Module):
     Phase 2: Add CSA2 sparse attention, full MoE, CED, Engram.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config=None,
-    ):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
 
         # Model
-        self.model = DeepseekV41Model(vllm_config, prefix="model")
+        self.model = DeepseekV41Model(vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         # LM head
         if get_pp_group().is_last_rank:
@@ -303,10 +321,16 @@ class DeepseekV41ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 bias=False,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
             )
             self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
         logger.info(
             f"Initialized DeepseekV41ForCausalLM (Phase 1 - BF16 baseline): "
@@ -315,6 +339,10 @@ class DeepseekV41ForCausalLM(nn.Module):
             f"vocab_size={config.vocab_size}"
         )
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed input token IDs."""
+        return self.model.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -322,7 +350,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> torch.Tensor:
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
             positions,
@@ -335,8 +364,8 @@ class DeepseekV41ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata,
-    ) -> torch.Tensor:
+        sampling_metadata=None,
+    ) -> torch.Tensor | None:
         logits = self.logits_processor(
             self.lm_head,
             hidden_states,
