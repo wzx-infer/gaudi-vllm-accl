@@ -116,12 +116,11 @@ def _register_tokenizers() -> None:
     """Register custom tokenizers with vLLM."""
     try:
         from vllm.tokenizers import TokenizerRegistry
-        from gaudi_vllm_accl.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
 
-        # Register DeepSeek V4.1 tokenizer
-        TokenizerRegistry.register_tokenizer(
+        # Register DeepSeek V4.1 tokenizer using string path format
+        TokenizerRegistry.register(
             "deepseek_v41",
-            DeepseekV41Tokenizer
+            "gaudi_vllm_accl.tokenizers.deepseek_v41:DeepseekV41Tokenizer"
         )
         logger.info("Registered DeepSeek V4.1 tokenizer")
     except Exception as e:
