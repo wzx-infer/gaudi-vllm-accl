@@ -49,38 +49,43 @@
 
 ## ⚠️ Current Blockers / 当前阻塞
 
-### 1. **Plugin Loading Order Issue** (Critical)
+### 1. **Runner Support Validation** (Critical - NEW)
 
 **Problem / 问题**:
-- vLLM initializes `ModelConfig` → calls `AutoConfig.from_pretrained()`
-- This happens **before** `vllm.general_plugins` are loaded
-- Result: Transformers fails with "model type `deepseek_v41` not recognized"
+- vLLM 0.26.0 validates that models support specific "runner" types
+- Error: `This model does not support --runner generate`
+- Config loads successfully, but model initialization fails validation
 
 **Evidence / 证据**:
 ```python
-# Manual registration works:
-from gaudi_vllm_accl.register import register
-register()
-config = AutoConfig.from_pretrained("/path/to/model")  # ✓ Success
+# Config loads successfully now!
+config = AutoConfig.from_pretrained('/mnt/4t_ext/DeepSeek-V4.1-Flash')  # ✓ Success
+print(config.model_type)  # deepseek_v41
 
-# But vLLM LLM() fails:
-from vllm import LLM
-llm = LLM(model="/path/to/model", ...)  # ✗ Fails: deepseek_v41 not recognized
+# But LLM initialization fails:
+llm = LLM(model='/mnt/4t_ext/DeepSeek-V4.1-Flash', ...)  
+# ✗ ValidationError: This model does not support `--runner generate`
 ```
 
 **Root Cause / 根本原因**:
-- Plugin's `register()` is called too late in vLLM's initialization sequence
-- vLLM's `ModelConfig.__init__()` validates config before loading general plugins
-
-**Attempted Solutions / 尝试过的方案**:
-1. ✗ Environment variable `VLLM_PLUGINS=gaudi_vllm_accl` → Still loads after config validation
-2. ✗ Manual `sys.path` injection + early `register()` call → Config still not recognized when vLLM imports
+- vLLM 0.26.0 introduced new validation for model runner support
+- Our model class may need to declare `supported_runners` or implement specific interfaces
+- Need to investigate vLLM's runner system requirements
 
 **Next Steps / 下一步**:
-- [ ] Investigate vLLM's plugin loading mechanism in `vllm/plugins/__init__.py`
-- [ ] Check if vLLM has an earlier plugin hook (e.g., `vllm.config_plugins`)
-- [ ] Consider monkey-patching `AutoConfig` as last resort
-- [ ] OR: Wait for vLLM to add proper config extension mechanism
+- [ ] Check vLLM 0.26.0 model interface requirements for runner support
+- [ ] Look at other Gaudi models to see how they declare runner compatibility
+- [ ] Add missing runner support declarations to our model class
+- [ ] Test with different runner modes if needed
+
+---
+
+### ~~1. Plugin Loading Order Issue~~ (RESOLVED ✅)
+
+**Resolution / 解决方案**:
+- Fixed duplicate `_register_transformers_config()` function definition (commit b4f5622)
+- Config registration now works correctly
+- Transformers successfully recognizes `deepseek_v41` model type
 
 ---
 
