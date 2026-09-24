@@ -7,14 +7,14 @@ from typing import Any
 from transformers import TokenizersBackend
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.tokenizers.hf import HfTokenizer, get_cached_tokenizer
+from vllm.tokenizers.protocol import TokenizerLike
 
 from .deepseek_v41_encoding import (
     IMAGE_PLACEHOLDER,
     REASONING_EFFORT_MAPPINGS,
     encode_messages,
 )
-from .hf import HfTokenizer, get_cached_tokenizer
-from .protocol import TokenizerLike
 
 
 def _normalize_messages(
