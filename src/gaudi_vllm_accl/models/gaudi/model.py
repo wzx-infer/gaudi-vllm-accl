@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     make_layers,
@@ -32,8 +33,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
-
-from ..interfaces import SupportsPP
 
 logger = init_logger(__name__)
 
