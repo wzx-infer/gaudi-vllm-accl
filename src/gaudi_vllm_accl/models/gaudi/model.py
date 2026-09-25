@@ -69,6 +69,7 @@ class DeepseekV41Attention(nn.Module):
             head_size=self.head_dim,
             scale=self.head_dim ** -0.5,
             num_kv_heads=config.num_key_value_heads,
+            prefix=prefix,
         )
 
         self.o_proj = RowParallelLinear(
