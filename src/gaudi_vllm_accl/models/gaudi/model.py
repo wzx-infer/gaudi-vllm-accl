@@ -447,10 +447,25 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
 
         # Phase 1: Text-only model, but checkpoint contains multimodal components
         # Add stub modules to receive weights (not used in forward pass)
-        if hasattr(config, "vision_n_heads"):
+        if hasattr(config, "vision_config") or hasattr(config, "vision_n_heads"):
             # Multimodal checkpoint: add stubs for vision/aligner weights
-            self.vision = DeepseekV4ViTStub(config)
-            self.aligner = DeepseekV4AlignerStub(config)
+            # Extract vision config fields (may be nested in vision_config or at top level)
+            vision_config = getattr(config, "vision_config", config)
+
+            # Create a stub config object with required vision fields
+            class VisionStubConfig:
+                def __init__(self, cfg):
+                    self.vision_dim = getattr(cfg, "hidden_size", 1024)
+                    self.vision_n_heads = getattr(cfg, "num_attention_heads", 16)
+                    self.vision_n_blocks = getattr(cfg, "num_hidden_layers", 32)
+                    self.vision_inter_dim = getattr(cfg, "intermediate_size", 4096)
+                    self.vision_patch_size = getattr(cfg, "patch_size", 16)
+                    self.vision_downsample_ratio = getattr(cfg, "downsample_ratio", 2)
+                    self.hidden_size = config.hidden_size  # LLM hidden size
+
+            stub_config = VisionStubConfig(vision_config)
+            self.vision = DeepseekV4ViTStub(stub_config)
+            self.aligner = DeepseekV4AlignerStub(stub_config)
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
