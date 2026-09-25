@@ -5,7 +5,7 @@ Phase 1: BF16 baseline with simplified architecture.
 Based on PR #56201, adapted for Gaudi hardware.
 """
 
-from typing import Optional, List, Tuple, Iterable
+from typing import Optional, Tuple, Iterable
 import torch
 import torch.nn as nn
 
@@ -93,8 +93,6 @@ class DeepseekV41Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
@@ -109,8 +107,9 @@ class DeepseekV41Attention(nn.Module):
         # Apply RoPE
         q, k = self.rotary_emb(positions, q, k)
 
-        # Attention
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        # Attention (V1 API: KV cache + attn_metadata are supplied via
+        # forward context, keyed by this layer's prefix - not passed explicitly)
+        attn_output = self.attn(q, k, v)
 
         # Output projection
         output, _ = self.o_proj(attn_output)
@@ -194,13 +193,11 @@ class DeepseekV41DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata,
     ) -> torch.Tensor:
         # Pre-attention norm + attention + residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, kv_cache, attn_metadata)
+        hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = residual + hidden_states
 
         # Pre-FFN norm + FFN + residual
@@ -255,15 +252,18 @@ class DeepseekV41Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Embedding
+        # Embedding (V1 API: no kv_caches/attn_metadata args - attention
+        # layers pull those from forward context by their registered prefix)
         if get_pp_group().is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -271,12 +271,7 @@ class DeepseekV41Model(nn.Module):
         # Transformer layers
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(
-                positions,
-                hidden_states,
-                kv_caches[i - self.start_layer],
-                attn_metadata,
-            )
+            hidden_states = layer(positions, hidden_states)
 
         # Final norm
         if get_pp_group().is_last_rank:
@@ -348,48 +343,109 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
             positions,
-            kv_caches,
-            attn_metadata,
             intermediate_tensors,
+            inputs_embeds,
         )
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata=None,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(
-            self.lm_head,
-            hidden_states,
-            sampling_metadata,
-        )
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Phase 1: Text-only mode - filter out multimodal weights
-        # Checkpoint contains: aligner.*, vision.*, image_start, image_end, image_newline
-        # These will be used in Phase 2 for full multimodal support
+        # Phase 1: Simplified architecture - filter out unsupported components.
+        # The full DeepSeek V4.1 checkpoint carries far more per-layer structure
+        # than this simplified Gaudi implementation models: full MLA attention
+        # (wq_a/wq_b/wkv/wo_a/wo_b, attn_sink, q_norm/kv_norm, compressor,
+        # indexer, swa_cache_layer, *.scale), MegaMoE (experts, gate,
+        # shared_expert(s)), multi-stream hyperconnections (hc_attn*/hc_ffn*),
+        # Engram sparse long-term memory (engram), and MTP (mtp.*). Rather than
+        # blocklisting each such sub-module by name (fragile - new ones keep
+        # appearing), allow-list the exact per-layer components this
+        # implementation supports and skip everything else under "layers.N.*".
+        ALLOWED_ATTN_LEAVES = ("qkv_proj.weight", "o_proj.weight")
+        ALLOWED_FFN_LEAVES = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+        ALLOWED_LAYER_KEYS = ("attn_norm.weight", "ffn_norm.weight")
+
         text_weights = []
-        skipped_count = 0
+        skipped_multimodal = 0
+        skipped_mtp = 0
+        skipped_unsupported_layer = 0
+
         for name, tensor in weights:
+            # Skip multimodal weights (Phase 1: text-only)
             if name.startswith(("aligner.", "vision.", "image_start", "image_end", "image_newline")):
-                skipped_count += 1
+                skipped_multimodal += 1
                 continue
+
+            # Skip MTP (Multi-Token Prediction) module (Phase 1: not implemented)
+            if name.startswith("mtp."):
+                skipped_mtp += 1
+                continue
+
+            if name.startswith("layers."):
+                if ".attn." in name:
+                    # Must be an immediate child of .attn. (e.g. "...attn.o_proj.weight"),
+                    # not a nested sub-module like indexer/compressor
+                    # (e.g. "...attn.indexer.wq_b.weight" must NOT match).
+                    leaf = name.rsplit(".attn.", 1)[1]
+                    keep = leaf in ALLOWED_ATTN_LEAVES
+                elif ".ffn." in name:
+                    # Same immediate-child requirement, to exclude e.g.
+                    # "...ffn.shared_expert.gate_proj.weight" (MegaMoE shared expert).
+                    leaf = name.rsplit(".ffn.", 1)[1]
+                    keep = leaf in ALLOWED_FFN_LEAVES
+                else:
+                    keep = name.endswith(ALLOWED_LAYER_KEYS)
+
+                if not keep:
+                    skipped_unsupported_layer += 1
+                    continue
+
+            # Map checkpoint naming to HuggingFace naming
+            if name == "embed.weight":
+                name = "model.embed_tokens.weight"
+            elif name == "head.weight":
+                name = "lm_head.weight"
+            elif name.startswith("layers."):
+                # Add model. prefix
+                name = "model." + name
+                # Replace attn -> self_attn
+                name = name.replace(".attn.", ".self_attn.")
+                # Replace ffn -> mlp
+                name = name.replace(".ffn.", ".mlp.")
+                # Replace attn_norm -> input_layernorm
+                name = name.replace(".attn_norm.", ".input_layernorm.")
+                # Replace ffn_norm -> post_attention_layernorm
+                name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
+            elif name == "norm.weight":
+                name = "model.norm.weight"
+
             text_weights.append((name, tensor))
 
-        if skipped_count > 0:
-            logger.info(f"Skipped {skipped_count} multimodal weights (Phase 1: text-only mode)")
+        # Log what was skipped
+        if skipped_multimodal > 0:
+            logger.info(f"Skipped {skipped_multimodal} multimodal weights (Phase 1: text-only)")
+        if skipped_mtp > 0:
+            logger.info(f"Skipped {skipped_mtp} MTP (Multi-Token Prediction) weights (Phase 1: not implemented)")
+        if skipped_unsupported_layer > 0:
+            logger.warning(
+                f"Skipped {skipped_unsupported_layer} per-layer weights not supported by the "
+                f"simplified Gaudi implementation (full MLA attention, MegaMoE experts, "
+                f"hyperconnections, Engram). Using standard QKV attention and dense FFN instead. "
+                f"This will impact model quality - see README Phase 2 for full architecture support."
+            )
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(text_weights)
