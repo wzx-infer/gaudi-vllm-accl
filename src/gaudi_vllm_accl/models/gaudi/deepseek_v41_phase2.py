@@ -32,6 +32,16 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.interfaces import SupportsPP
 
+# Import Phase 2 components
+try:
+    from gaudi_vllm_accl.models.gaudi.compressor import DeepseekCompressor, get_compress_ratio
+    from gaudi_vllm_accl.models.gaudi.moe import DeepseekV41MegaMoE
+except ImportError:
+    # Fallback if running in different environment
+    DeepseekCompressor = None
+    get_compress_ratio = None
+    DeepseekV41MegaMoE = None
+
 logger = init_logger(__name__)
 
 
@@ -82,6 +92,19 @@ class DeepseekV41MLAAttention(nn.Module):
         self.n_local_heads = self.n_heads // tp_size
         assert self.n_groups % tp_size == 0
         self.n_local_groups = self.n_groups // tp_size
+
+        # Phase 2.2: Add Compressor if available
+        if DeepseekCompressor is not None and get_compress_ratio is not None:
+            compress_ratio = get_compress_ratio(layer_idx, text_config)
+            self.compressor = DeepseekCompressor(
+                compress_ratio=compress_ratio,
+                hidden_size=self.hidden_size,
+                head_dim=self.head_dim,
+                rms_norm_eps=self.eps,
+                prefix=f"{prefix}.compressor",
+            )
+        else:
+            self.compressor = None
 
         # Phase 2: Complete MLA architecture from PR #56201
         # Step 1: Fused Q-LoRA-a and KV projection (replicated, no TP)
@@ -150,7 +173,8 @@ class DeepseekV41MLAAttention(nn.Module):
             f"DeepSeekV41MLAAttention layer {layer_idx}: "
             f"n_heads={self.n_heads}, n_local_heads={self.n_local_heads}, "
             f"head_dim={self.head_dim}, q_lora_rank={self.q_lora_rank}, "
-            f"o_lora_rank={self.o_lora_rank}, n_groups={self.n_groups}"
+            f"o_lora_rank={self.o_lora_rank}, n_groups={self.n_groups}, "
+            f"compressor={'enabled' if self.compressor else 'disabled'}"
         )
 
     def forward(
@@ -159,14 +183,15 @@ class DeepseekV41MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """
-        MLA attention forward pass.
+        MLA attention forward pass with integrated compressor.
 
-        Data flow (from PR #56201):
+        Data flow (Phase 2.2):
         1. hidden -> fused_wqa_wkv -> [q_latent, kv_latent]
         2. q_latent -> q_norm -> wq_b -> q [batch, n_local_heads, head_dim]
         3. kv_latent -> kv_norm -> compressed_kv [batch, 1, head_dim]
-        4. attention(q, k, v) -> attn_out [batch, n_local_heads, head_dim]
-        5. attn_out -> wo_a -> wo_b -> output [batch, hidden_size]
+        4. (optional) compressed_kv -> compressor -> further compressed
+        5. attention(q, k, v) -> attn_out [batch, n_local_heads, head_dim]
+        6. attn_out -> wo_a -> wo_b -> output [batch, hidden_size]
         """
         batch_size = hidden_states.shape[0]
 
@@ -182,17 +207,23 @@ class DeepseekV41MLAAttention(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(batch_size, self.n_local_heads, self.head_dim)
 
-        # Step 4: Decompress KV for attention
-        # In full MLA, compressed KV would be stored in cache and decompressed on-the-fly
-        # For Phase 2 bring-up, we expand the single KV latent to match Q's structure
-        # TODO: Replace with proper compressor/decompressor from PR #56201
-        k = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
-        v = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
+        # Step 4: Compress KV if compressor is available
+        if self.compressor is not None:
+            # Apply compressor to KV latent
+            # Input: [batch, head_dim], Output: [batch_compressed, head_dim]
+            kv_compressed = self.compressor(kv, positions)
+            # Expand compressed KV to match Q structure
+            k = kv_compressed.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+            v = kv_compressed.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+        else:
+            # No compressor: expand single KV latent to match Q's structure
+            k = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
+            v = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
 
         # Step 5: Flatten for attention (V1 API)
         q = q.reshape(batch_size, -1)
-        k = k.reshape(batch_size, -1)
-        v = v.reshape(batch_size, -1)
+        k = k.reshape(k.shape[0], -1)
+        v = v.reshape(v.shape[0], -1)
 
         # Attention (V1 API: cache/metadata from forward context)
         attn_out = self.attn(q, k, v)
@@ -227,22 +258,28 @@ class DeepseekV41DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        # TODO Phase 2: Replace with MegaMoE
-        # For now, use simple dense FFN as placeholder
-        from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-        from vllm.model_executor.layers.activation import SiluAndMul
-
-        self.gate_up_proj = ColumnParallelLinear(
-            self.hidden_size,
-            2 * config.intermediate_size,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            self.hidden_size,
-            bias=False,
-        )
-        self.act_fn = SiluAndMul()
+        # Phase 2.3: MegaMoE
+        if DeepseekV41MegaMoE is not None:
+            self.mlp = DeepseekV41MegaMoE(
+                config,
+                layer_idx,
+                prefix=f"{prefix}.mlp",
+            )
+        else:
+            # Fallback: simple dense FFN
+            from vllm.model_executor.layers.activation import SiluAndMul
+            self.gate_up_proj = ColumnParallelLinear(
+                self.hidden_size,
+                2 * config.intermediate_size,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                config.intermediate_size,
+                self.hidden_size,
+                bias=False,
+            )
+            self.act_fn = SiluAndMul()
+            self.mlp = None
 
         # Layer norms
         self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -259,12 +296,17 @@ class DeepseekV41DecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = residual + hidden_states
 
-        # FFN block
+        # FFN/MoE block
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(hidden_states)
+        if self.mlp is not None:
+            # Phase 2.3: Use MegaMoE
+            hidden_states = self.mlp(hidden_states)
+        else:
+            # Fallback: dense FFN
+            gate_up, _ = self.gate_up_proj(hidden_states)
+            hidden_states = self.act_fn(gate_up)
+            hidden_states, _ = self.down_proj(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -422,25 +464,32 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
 
     def load_weights(self, weights):
         """
-        Load weights for Phase 2 MLA architecture.
+        Load weights for Phase 2.3 - MLA + MegaMoE architecture.
 
-        Updated allow-list for MLA components:
+        Phase 2.3 allow-list:
         - Attention: wq_a, wq_b, wkv, q_norm, kv_norm, wo_a, wo_b
-        - FFN: gate_proj, up_proj, down_proj (dense for now)
+        - MegaMoE shared expert: shared_gate_proj, shared_up_proj, shared_down_proj
+        - Dense FFN fallback: gate_proj, up_proj, down_proj
         - Layer norms: attn_norm, ffn_norm
 
-        Still skipped:
-        - Compressor/indexer (TODO Phase 2.1)
-        - MoE experts (TODO Phase 2.2)
-        - Hyperconnections/Engram (TODO Phase 2.3)
+        Still skipped (future work):
+        - Compressor internals (fused_wkv_wgate)
+        - 384 routed experts (requires expert parallelism)
+        - Hyperconnections (hc_attn_base, hc_ffn_base)
+        - Engram sparse memory
+        - Indexer sparse attention
         """
-        # Phase 2: MLA architecture allow-list
+        # Phase 2.3: MLA + MegaMoE architecture allow-list
         ALLOWED_ATTN_LEAVES = (
             "wq_a.weight", "wq_b.weight", "wkv.weight",
             "q_norm.weight", "kv_norm.weight",
             "wo_a.weight", "wo_b.weight",
         )
-        ALLOWED_FFN_LEAVES = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+        # Phase 2.3: Accept shared expert weights (384 routed experts still skipped)
+        ALLOWED_FFN_LEAVES = (
+            "gate_proj.weight", "up_proj.weight", "down_proj.weight",
+            "shared_gate_proj.weight", "shared_up_proj.weight", "shared_down_proj.weight",
+        )
         ALLOWED_LAYER_KEYS = ("attn_norm.weight", "ffn_norm.weight")
 
         text_weights = []
@@ -464,8 +513,15 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                     leaf = name.rsplit(".attn.", 1)[1]
                     keep = leaf in ALLOWED_ATTN_LEAVES
                 elif ".ffn." in name:
+                    # Handle both direct FFN weights and shared_expert nested weights
                     leaf = name.rsplit(".ffn.", 1)[1]
-                    keep = leaf in ALLOWED_FFN_LEAVES
+                    # Check if it's a shared expert weight (nested under shared_expert.)
+                    if leaf.startswith("shared_expert."):
+                        # Extract the final leaf after shared_expert.
+                        final_leaf = leaf.replace("shared_expert.", "")
+                        keep = final_leaf in ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+                    else:
+                        keep = leaf in ALLOWED_FFN_LEAVES
                 else:
                     keep = name.endswith(ALLOWED_LAYER_KEYS)
 
