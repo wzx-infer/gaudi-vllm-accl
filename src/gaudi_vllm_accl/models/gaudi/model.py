@@ -79,10 +79,12 @@ class DeepseekV41Attention(nn.Module):
 
         # RoPE
         self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
+            head_size=self.head_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": config.rope_theta,
+            },
         )
 
     def forward(
