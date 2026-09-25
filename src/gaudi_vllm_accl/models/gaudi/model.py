@@ -18,8 +18,6 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
-    MergedColumnParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -38,134 +36,6 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
-
-
-class DeepseekV4AlignerStub(nn.Module):
-    """Minimal aligner stub to receive multimodal weights (Phase 1: not used in forward)."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.downsample_ratio = config.vision_downsample_ratio
-        in_dim = config.vision_dim * self.downsample_ratio**2
-        # Real layers to receive weights from checkpoint
-        self.w1 = ColumnParallelLinear(
-            in_dim,
-            config.hidden_size,
-            bias=True,
-        )
-        self.w2 = RowParallelLinear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=True,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Phase 1: Not called (text-only mode)
-        raise NotImplementedError("Multimodal forward not implemented in Phase 1")
-
-
-class DeepseekV4RMSNormStub(nn.Module):
-    """Minimal RMSNorm for vision tower stub."""
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
-
-
-class DeepseekV4PatchEmbedStub(nn.Module):
-    """Minimal patch embedding stub."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.proj = ReplicatedLinear(
-            3 * config.vision_patch_size**2,
-            config.vision_dim,
-            bias=True,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
-
-
-class DeepseekV4VisionAttentionStub(nn.Module):
-    """Minimal vision attention stub."""
-
-    def __init__(self, config, prefix: str = ""):
-        super().__init__()
-        self.n_heads = config.vision_n_heads
-        self.head_dim = config.vision_dim // config.vision_n_heads
-        self.wqkv = QKVParallelLinear(
-            config.vision_dim,
-            self.head_dim,
-            config.vision_n_heads,
-            bias=True,
-            prefix=f"{prefix}.wqkv",
-        )
-        self.wo = RowParallelLinear(
-            config.vision_dim,
-            config.vision_dim,
-            bias=True,
-            prefix=f"{prefix}.wo",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
-
-
-class DeepseekV4VisionMLPStub(nn.Module):
-    """Minimal vision MLP stub."""
-
-    def __init__(self, config, prefix: str = ""):
-        super().__init__()
-        self.w1 = MergedColumnParallelLinear(
-            config.vision_dim,
-            [config.vision_inter_dim] * 2,
-            bias=False,
-            prefix=f"{prefix}.w1",
-        )
-        self.w2 = RowParallelLinear(
-            config.vision_inter_dim,
-            config.vision_dim,
-            bias=False,
-            prefix=f"{prefix}.w2",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
-
-
-class DeepseekV4VisionBlockStub(nn.Module):
-    """Minimal vision block stub."""
-
-    def __init__(self, config, layer_idx: int, prefix: str = ""):
-        super().__init__()
-        self.norm1 = DeepseekV4RMSNormStub(config.vision_dim)
-        self.attn = DeepseekV4VisionAttentionStub(config, prefix=f"{prefix}.attn")
-        self.norm2 = DeepseekV4RMSNormStub(config.vision_dim)
-        self.mlp = DeepseekV4VisionMLPStub(config, prefix=f"{prefix}.mlp")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
-
-
-class DeepseekV4ViTStub(nn.Module):
-    """Minimal ViT stub to receive vision tower weights (Phase 1: not used)."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.patch_embed = DeepseekV4PatchEmbedStub(config)
-        self.blocks = nn.ModuleList([
-            DeepseekV4VisionBlockStub(config, i, prefix=f"blocks.{i}")
-            for i in range(config.vision_n_blocks)
-        ])
-        self.norm = DeepseekV4RMSNormStub(config.vision_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Vision forward not implemented in Phase 1")
 
 
 class DeepseekV41Attention(nn.Module):
@@ -534,8 +404,22 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Phase 1: Text-only mode - filter out multimodal weights
+        # Checkpoint contains: aligner.*, vision.*, image_start, image_end, image_newline
+        # These will be used in Phase 2 for full multimodal support
+        text_weights = []
+        skipped_count = 0
+        for name, tensor in weights:
+            if name.startswith(("aligner.", "vision.", "image_start", "image_end", "image_newline")):
+                skipped_count += 1
+                continue
+            text_weights.append((name, tensor))
+
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} multimodal weights (Phase 1: text-only mode)")
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(text_weights)
 
     def make_empty_intermediate_tensors(
         self,
