@@ -314,6 +314,17 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         self.config = config
         self.quant_config = quant_config
 
+        # Phase 1: Text-only model, but checkpoint contains multimodal components
+        # Add placeholder modules to receive weights (not used in forward pass)
+        if hasattr(config, "vision_n_heads"):
+            # Multimodal checkpoint: add placeholders for vision/aligner weights
+            self.vision = nn.ModuleDict()  # Placeholder for vision tower weights
+            self.aligner = nn.ModuleDict()  # Placeholder for aligner weights
+            self.image_start = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_end = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+            logger.info("Added placeholders for multimodal weights (Phase 1: text-only)")
+
         # Model
         self.model = DeepseekV41Model(vllm_config, prefix=maybe_prefix(prefix, "model"))
 
