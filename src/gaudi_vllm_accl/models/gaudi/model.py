@@ -48,7 +48,8 @@ class DeepseekV41Attention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.total_num_heads = config.num_attention_heads
+        self.num_heads = config.num_attention_heads // get_tensor_model_parallel_world_size()
         self.head_dim = config.head_dim
         self.num_kv_heads = config.num_key_value_heads
         self.q_lora_rank = config.q_lora_rank
@@ -59,7 +60,7 @@ class DeepseekV41Attention(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
-            self.num_heads,
+            self.total_num_heads,
             config.num_key_value_heads,
             bias=False,
         )
@@ -75,7 +76,7 @@ class DeepseekV41Attention(nn.Module):
         )
 
         self.o_proj = RowParallelLinear(
-            self.num_heads * self.head_dim,
+            self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
         )
