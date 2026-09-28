@@ -70,6 +70,7 @@ class DeepseekV41Attention(nn.Module):
             head_size=self.head_dim,
             scale=self.head_dim ** -0.5,
             num_kv_heads=config.num_key_value_heads,
+            cache_config=vllm_config.cache_config,
             prefix=prefix,
         )
 
