@@ -118,6 +118,12 @@ class DeepseekV41MLAAttention(nn.Module):
             disable_tp=True,  # Replicated linear (all ranks compute same output)
         )
 
+        # [CHECK 1.1] Verify fused_wqa_wkv was created correctly
+        fused_shape = self.fused_wqa_wkv.weight.shape
+        expected_out = self.q_lora_rank + self.head_dim  # 1280 + 512 = 1792
+        print(f"[CHECK 1] Layer {layer_idx} fused_wqa_wkv shape: {fused_shape}, expected out_features={expected_out}", flush=True)
+        assert fused_shape[0] == expected_out, f"fused_wqa_wkv out_features mismatch: {fused_shape[0]} != {expected_out}"
+
         # Step 2: Normalize Q and KV latents
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
@@ -166,6 +172,7 @@ class DeepseekV41MLAAttention(nn.Module):
             head_size=self.head_dim,
             scale=self.head_dim ** -0.5,
             num_kv_heads=1,  # Extreme MQA: single KV head
+            cache_config=vllm_config.cache_config,
             prefix=prefix,
         )
 
@@ -195,30 +202,46 @@ class DeepseekV41MLAAttention(nn.Module):
         """
         batch_size = hidden_states.shape[0]
 
+        def debug_tensor(name, tensor):
+            if self.layer_idx == 0:
+                has_nan = torch.isnan(tensor).any().item()
+                has_inf = torch.isinf(tensor).any().item()
+                logger.warning(
+                    f"[Layer {self.layer_idx}] {name}: shape={tensor.shape}, "
+                    f"min={tensor.min().item():.4f}, max={tensor.max().item():.4f}, "
+                    f"mean={tensor.mean().item():.4f}, has_nan={has_nan}, has_inf={has_inf}"
+                )
+
+        debug_tensor("input_hidden_states", hidden_states)
+
         # Step 1: Fused Q-LoRA-a and KV projection
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        debug_tensor("qr_after_split", qr)
+        debug_tensor("kv_after_split", kv)
 
         # Step 2: Normalize Q and KV latents
         qr = self.q_norm(qr)
         kv = self.kv_norm(kv)
+        debug_tensor("qr_after_norm", qr)
+        debug_tensor("kv_after_norm", kv)
 
         # Step 3: Q-LoRA-b projection
         q, _ = self.wq_b(qr)
         q = q.view(batch_size, self.n_local_heads, self.head_dim)
+        debug_tensor("q_after_wqb", q)
 
         # Step 4: Compress KV if compressor is available
         if self.compressor is not None:
-            # Apply compressor to KV latent
-            # Input: [batch, head_dim], Output: [batch_compressed, head_dim]
             kv_compressed = self.compressor(kv, positions)
-            # Expand compressed KV to match Q structure
             k = kv_compressed.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
             v = kv_compressed.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+            debug_tensor("kv_compressed", kv_compressed)
         else:
-            # No compressor: expand single KV latent to match Q's structure
             k = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
             v = kv.unsqueeze(1).expand(batch_size, self.n_local_heads, self.head_dim)
+        debug_tensor("k_expanded", k)
+        debug_tensor("v_expanded", v)
 
         # Step 5: Flatten for attention (V1 API)
         q = q.reshape(batch_size, -1)
@@ -227,12 +250,27 @@ class DeepseekV41MLAAttention(nn.Module):
 
         # Attention (V1 API: cache/metadata from forward context)
         attn_out = self.attn(q, k, v)
+        debug_tensor("attn_out", attn_out)
 
         # Step 6: Grouped output projection
-        # Reshape for grouped projection
-        attn_out = attn_out.view(batch_size, self.n_local_groups, -1)
+        # attn_out shape: [batch, seq, n_local_heads * head_dim]
+        # Need to reshape to: [batch, seq, n_local_groups, heads_per_group * head_dim]
+        heads_per_group = self.n_local_heads // self.n_local_groups
+        attn_out = attn_out.view(batch_size, -1, self.n_local_groups, heads_per_group * self.head_dim)
+        # Transpose to [batch, n_local_groups, seq, heads_per_group * head_dim] for batch matmul
+        attn_out = attn_out.transpose(1, 2).contiguous()
+        attn_out = attn_out.view(batch_size * self.n_local_groups, -1, heads_per_group * self.head_dim)
+
         output, _ = self.wo_a(attn_out)
+        debug_tensor("output_after_woa", output)
+
+        # Reshape back and apply wo_b
+        output = output.view(batch_size, self.n_local_groups, -1, self.o_lora_rank)
+        output = output.transpose(1, 2).contiguous()
+        output = output.view(batch_size, -1, self.n_local_groups * self.o_lora_rank)
+
         output, _ = self.wo_b(output)
+        debug_tensor("output_after_wob", output)
 
         return output
 
@@ -542,14 +580,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 name = name.replace(".attn_norm.", ".input_layernorm.")
                 name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-                # Handle fused_wqa_wkv mapping
-                # Checkpoint has separate wq_a and wkv, but we have fused_wqa_wkv
-                if ".self_attn.wq_a.weight" in name:
-                    # Will be loaded into fused_wqa_wkv's first output channel
-                    name = name.replace(".wq_a.weight", ".fused_wqa_wkv.weight.0")
-                elif ".self_attn.wkv.weight" in name:
-                    # Will be loaded into fused_wqa_wkv's second output channel
-                    name = name.replace(".wkv.weight", ".fused_wqa_wkv.weight.1")
+                # Phase 2: No weight renaming needed - direct 1:1 mapping
+                # wq_a.weight -> wq_a.weight, wkv.weight -> wkv.weight, etc.
             elif name == "norm.weight":
                 name = "model.norm.weight"
 
