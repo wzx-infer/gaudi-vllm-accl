@@ -51,6 +51,7 @@ class DeepseekV41Attention(nn.Module):
         self.head_dim = config.head_dim
         self.q_lora_rank = config.q_lora_rank
         self.layer_idx = layer_idx
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         # Phase 1: Use standard QKV projection
         # TODO: Replace with MLA's compressed KV + LoRA Q
@@ -68,7 +69,7 @@ class DeepseekV41Attention(nn.Module):
 
         # Standard attention
         self.attn = Attention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads // self.tp_size,
             head_size=self.head_dim,
             scale=self.head_dim ** -0.5,
             num_kv_heads=self.num_kv_heads,
@@ -99,7 +100,7 @@ class DeepseekV41Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
             [
-                self.num_heads * self.head_dim,
+                self.num_heads * self.head_dim // self.tp_size,
                 self.num_kv_heads * self.head_dim,
                 self.num_kv_heads * self.head_dim,
             ],
