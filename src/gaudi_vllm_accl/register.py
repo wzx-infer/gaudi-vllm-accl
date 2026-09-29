@@ -53,6 +53,7 @@ def _check_vllm_version() -> None:
 
 def register() -> None:
     """Main plugin registration function called by vLLM."""
+    import sys as _sys; print("[register] called", file=_sys.stderr, flush=True)
     logger.info("Registering gaudi-vllm-accl plugin...")
 
     # Step 0: Verify vLLM version before any registration
@@ -107,10 +108,14 @@ def _register_models() -> None:
         # Use string format to avoid CUDA initialization on import
         ModelRegistry.register_model(
             "DeepseekV41ForCausalLM",
-            "gaudi_vllm_accl.models.gaudi.model:DeepseekV41ForCausalLM"
+            "gaudi_vllm_accl.models.gaudi.deepseek_v41_hpa:DeepseekV41ForCausalLM"
         )
+        import sys as _s; print("[register] model registered OK", file=_s.stderr, flush=True)
         logger.info("Registered model: DeepseekV41ForCausalLM")
     except Exception as e:
+        import sys as _s, traceback as _t
+        print(f"[register] model FAILED: {e}", file=_s.stderr, flush=True)
+        _t.print_exc()
         logger.error(f"Failed to register DeepseekV41ForCausalLM: {e}")
 
 
@@ -131,5 +136,11 @@ def _register_tokenizers() -> None:
 
 
 def _register_accel() -> None:
+    try:
+        import vllm_gaudi.attention.oot_mla  # noqa: F401
+        logger.info('Registered HPU MLA OOT wrapper')
+    except Exception as e:
+        logger.error(f'Failed to import vllm_gaudi.attention.oot_mla: {e}')
+
     """Register acceleration features (placeholder for future)."""
     logger.info("Acceleration features registration: not yet implemented")
