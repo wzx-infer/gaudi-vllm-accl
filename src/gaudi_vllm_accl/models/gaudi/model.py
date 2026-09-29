@@ -48,9 +48,7 @@ class DeepseekV41Attention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.num_kv_heads = config.num_key_value_heads
         self.q_lora_rank = config.q_lora_rank
         self.layer_idx = layer_idx
 
@@ -59,17 +57,21 @@ class DeepseekV41Attention(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
-            self.num_heads,
+            config.num_attention_heads,
             config.num_key_value_heads,
             bias=False,
         )
+
+        # Get TP-sharded head counts from qkv_proj
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
 
         # Standard attention
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             scale=self.head_dim ** -0.5,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=self.num_kv_heads,
             prefix=prefix,
         )
 
