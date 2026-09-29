@@ -1,4 +1,4 @@
-"""DeepSeek V4.1 Flash - Phase 0 HPU implementation with checkpoint-aligned weight naming."""
+"""DeepSeek V4.1 Flash - Phase 1 HPU implementation with correct architecture."""
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List
@@ -20,7 +20,7 @@ from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
 
 
 class DeepseekV41Attention(nn.Module):
-    """Phase 0: Pure PyTorch attention matching checkpoint weight names."""
+    """Phase 1: Correct MLA architecture - wq_a and wkv are separate."""
     
     def __init__(
         self,
@@ -33,12 +33,12 @@ class DeepseekV41Attention(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.nope_head_dim = config.qk_nope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
+        self.head_dim = config.head_dim  # 512 = nope(448) + rope(64)
+        self.rope_head_dim = config.qk_rope_head_dim  # 64
+        self.nope_head_dim = self.head_dim - self.rope_head_dim  # 448
+        self.v_head_dim = config.v_head_dim  # 512
+        self.q_lora_rank = config.q_lora_rank  # 1280
+        self.num_kv_heads = config.num_key_value_heads  # 1
         
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_size = tp_size
@@ -48,24 +48,36 @@ class DeepseekV41Attention(nn.Module):
         
         self.scaling = self.head_dim ** -0.5
         
-        # Checkpoint naming: fused_wqa_wkv = [wq_a; wkv]
-        fused_dim = self.q_lora_rank + self.kv_lora_rank + self.rope_head_dim
-        self.fused_wqa_wkv = nn.Linear(self.hidden_size, fused_dim, bias=False)
+        # Correct: wq_a and wkv are TWO SEPARATE weights
+        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
+        self.wkv = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         
         # Norms
         self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         
         # Q projection: q_lora_rank -> num_heads * head_dim (TP sharded)
         self.wq_b = nn.Linear(self.q_lora_rank, self.num_local_heads * self.head_dim, bias=False)
         
-        # O projection (LoRA style)
-        self.o_lora_rank = getattr(config, 'o_lora_rank', self.kv_lora_rank)
-        self.wo_a = nn.Linear(self.num_local_heads * self.v_head_dim, self.o_lora_rank, bias=False)
-        self.wo_b = nn.Linear(self.o_lora_rank, self.hidden_size, bias=False)
+        # O projection (LoRA style with groups)
+        self.o_lora_rank = config.o_lora_rank  # 1024
+        self.o_groups = config.o_groups  # 8
+        assert self.o_groups % tp_size == 0
+        self.num_local_groups = self.o_groups // tp_size
         
-        # Attention sink
-        self.attn_sink = nn.Parameter(torch.zeros(1, self.num_local_heads, 1, self.v_head_dim))
+        # wo_a: 8 groups, each group processes [num_heads/8 * v_head_dim] -> o_lora_rank
+        # Input: [num_local_heads * v_head_dim] = [64/8 * 512] = [4096] when TP=8
+        # Output: [num_local_groups * o_lora_rank] = [1 * 1024] = [1024] when TP=8
+        #         or [8 * 1024] = [8192] when TP=1
+        self.wo_a = nn.Linear(
+            self.num_local_heads * self.v_head_dim, 
+            self.num_local_groups * self.o_lora_rank, 
+            bias=False
+        )
+        self.wo_b = nn.Linear(self.o_groups * self.o_lora_rank, self.hidden_size, bias=False)
+        
+        # Attention sink: [num_local_heads] per-head scalars
+        self.attn_sink = nn.Parameter(torch.zeros(self.num_local_heads))
         
         # RoPE
         rope_params = getattr(config, "rope_parameters", None) or {}
@@ -86,47 +98,49 @@ class DeepseekV41Attention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: HPUAttentionMetadata,
     ) -> torch.Tensor:
-        # Fused projection
-        fused = self.fused_wqa_wkv(hidden_states)
+        # Separate projections
+        qr = self.wq_a(hidden_states)  # [T, 1280]
+        kv = self.wkv(hidden_states)   # [T, 512]
         
-        # Split: [wq_a, kv_a, rope_k]
-        wq_a = fused[:, :self.q_lora_rank]
-        kv_a = fused[:, self.q_lora_rank:self.q_lora_rank + self.kv_lora_rank]
-        rope_k = fused[:, self.q_lora_rank + self.kv_lora_rank:]
+        # Normalize
+        qr = self.q_norm(qr)  # [T, 1280]
+        kv = self.kv_norm(kv)  # [T, 512]
         
-        # Q path
-        wq_a = self.q_norm(wq_a)
-        q = self.wq_b(wq_a)
-        q = q.view(-1, self.num_local_heads, self.head_dim)
+        # Q projection
+        q = self.wq_b(qr)  # [T, num_local_heads * 512]
+        q = q.view(-1, self.num_local_heads, self.head_dim)  # [T, 64/TP, 512]
         
-        # Split Q into nope and rope parts
-        q_nope = q[:, :, :self.nope_head_dim]
-        q_rope = q[:, :, self.nope_head_dim:]
+        # KV: replicate to all heads (num_kv_heads=1)
+        kv = kv.unsqueeze(1).expand(-1, self.num_local_heads, -1)  # [T, 64/TP, 512]
+        
+        # RoPE: apply to the LAST 64 dims [448:512]
+        q_nope = q[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
+        q_rope = q[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
         q_rope = self.rotary_emb(positions, q_rope)
-        q = torch.cat([q_nope, q_rope], dim=-1)
+        q = torch.cat([q_nope, q_rope], dim=-1)  # [T, 64/TP, 512]
         
-        # KV path
-        kv_a = self.kv_norm(kv_a)
-        # Phase 0: Simplified - replicate KV across heads
-        kv_expanded = kv_a.unsqueeze(1).expand(-1, self.num_local_heads, -1)
-        
-        # K: nope + rope
-        k_nope = kv_expanded[:, :, :self.nope_head_dim]
-        k_rope = rope_k.view(-1, 1, self.rope_head_dim).expand(-1, self.num_local_heads, -1)
+        k_nope = kv[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
+        k_rope = kv[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
         k_rope = self.rotary_emb(positions, k_rope)
-        k = torch.cat([k_nope, k_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)  # [T, 64/TP, 512]
         
-        # V
-        v = kv_expanded[:, :, self.nope_head_dim:self.nope_head_dim + self.v_head_dim]
+        # V: same as kv (for Phase 1, v_head_dim == head_dim == 512)
+        v = kv  # [T, 64/TP, 512]
         
-        # Attention (Phase 0: simple scaled dot-product)
-        attn_output = self._simple_attention(q, k, v, kv_cache, attn_metadata)
+        # Attention
+        attn_output = self._simple_attention(q, k, v, kv_cache, attn_metadata)  # [T, 64/TP, 512]
+        
+        # Inverse RoPE on output (optional for Phase 1, can skip)
+        # o_nope = attn_output[:, :, :self.nope_head_dim]
+        # o_rope = attn_output[:, :, self.nope_head_dim:]
+        # o_rope = self.rotary_emb.inverse(positions, o_rope)
+        # attn_output = torch.cat([o_nope, o_rope], dim=-1)
         
         # Output projection
-        attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
-        out = self.wo_a(attn_output)
-        out = tensor_model_parallel_all_reduce(out)
-        out = self.wo_b(out)
+        attn_output = attn_output.contiguous().view(-1, self.num_local_heads * self.v_head_dim)  # [T, 4096] when TP=8
+        out = self.wo_a(attn_output)  # [T, 1024] when TP=8
+        out = tensor_model_parallel_all_reduce(out)  # [T, 1024]
+        out = self.wo_b(out)  # [T, 5120]
         
         return out
     
@@ -138,16 +152,20 @@ class DeepseekV41Attention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: HPUAttentionMetadata,
     ) -> torch.Tensor:
-        """Phase 0: Simple PyTorch attention without PagedAttention."""
+        """Phase 1: Simple PyTorch attention without PagedAttention."""
         # q, k, v: [tokens, num_local_heads, dim]
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [T, H, T]
+        
+        # Add attn_sink: [num_local_heads] -> broadcast to [1, H, 1]
+        attn_weights = attn_weights + self.attn_sink.view(1, -1, 1)
+        
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)
+        attn_output = torch.matmul(attn_weights, v)  # [T, H, D]
         return attn_output
 
 
 class DeepseekV41MoE(nn.Module):
-    """Phase 0: Only shared experts."""
+    """Phase 1: Only shared experts, no routed experts."""
     
     def __init__(self, config: DeepSeekV41Config, layer_idx: int):
         super().__init__()
@@ -156,15 +174,20 @@ class DeepseekV41MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
         
-        # Shared experts only
-        self.shared_gate_up = nn.Linear(self.hidden_size, 2 * self.moe_intermediate_size, bias=False)
-        self.shared_down = nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False)
+        # Shared experts only (gate is ignored in Phase 1)
+        self.gate = nn.Linear(self.hidden_size, config.n_routed_experts, bias=False)
+        self.w1 = nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False)
+        self.w2 = nn.Linear(self.moe_intermediate_size, self.hidden_size, bias=False)
+        self.w3 = nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False)
         self.act_fn = SiluAndMul()
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up = self.shared_gate_up(hidden_states)
+        # Phase 1: Only use shared experts
+        x1 = self.w1(hidden_states)
+        x3 = self.w3(hidden_states)
+        gate_up = torch.cat([x1, x3], dim=-1)
         x = self.act_fn(gate_up)
-        x = self.shared_down(x)
+        x = self.w2(x)
         return x
 
 
@@ -299,13 +322,19 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         """Load weights from checkpoint with FP8 dequantization."""
         params_dict = dict(self.named_parameters())
         
-        # Build weight mapping: checkpoint name -> model parameter name
+        # Cache all .scale tensors for FP8 dequantization
+        scale_cache = {}
+        for name, loaded_weight in weights:
+            if name.endswith(".scale"):
+                scale_cache[name[:-6]] = loaded_weight  # Remove ".scale" suffix
+        
+        # Build weight mapping
         weight_map = {}
         for layer_idx in range(self.config.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
-            # Attention weights
-            weight_map[f"layers.{layer_idx}.attn.wq_a.weight"] = f"{prefix}.self_attn.fused_wqa_wkv.weight"
-            weight_map[f"layers.{layer_idx}.attn.wkv.weight"] = f"{prefix}.self_attn.fused_wqa_wkv.weight"
+            # Attention weights - SEPARATE wq_a and wkv
+            weight_map[f"layers.{layer_idx}.attn.wq_a.weight"] = f"{prefix}.self_attn.wq_a.weight"
+            weight_map[f"layers.{layer_idx}.attn.wkv.weight"] = f"{prefix}.self_attn.wkv.weight"
             weight_map[f"layers.{layer_idx}.attn.wq_b.weight"] = f"{prefix}.self_attn.wq_b.weight"
             weight_map[f"layers.{layer_idx}.attn.wo_a.weight"] = f"{prefix}.self_attn.wo_a.weight"
             weight_map[f"layers.{layer_idx}.attn.wo_b.weight"] = f"{prefix}.self_attn.wo_b.weight"
@@ -313,8 +342,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
             weight_map[f"layers.{layer_idx}.attn.kv_norm.weight"] = f"{prefix}.self_attn.kv_norm.weight"
             weight_map[f"layers.{layer_idx}.attn.attn_sink"] = f"{prefix}.self_attn.attn_sink"
             # MLP weights
-            weight_map[f"layers.{layer_idx}.ffn.shared_experts.w1.weight"] = f"{prefix}.mlp.shared_gate_up.weight"
-            weight_map[f"layers.{layer_idx}.ffn.shared_experts.w2.weight"] = f"{prefix}.mlp.shared_down.weight"
+            weight_map[f"layers.{layer_idx}.ffn.gate.weight"] = f"{prefix}.mlp.gate.weight"
+            weight_map[f"layers.{layer_idx}.ffn.shared_experts.w1.weight"] = f"{prefix}.mlp.w1.weight"
+            weight_map[f"layers.{layer_idx}.ffn.shared_experts.w2.weight"] = f"{prefix}.mlp.w2.weight"
+            weight_map[f"layers.{layer_idx}.ffn.shared_experts.w3.weight"] = f"{prefix}.mlp.w3.weight"
             # Norms
             weight_map[f"layers.{layer_idx}.attn_norm.weight"] = f"{prefix}.input_layernorm.weight"
             weight_map[f"layers.{layer_idx}.ffn_norm.weight"] = f"{prefix}.post_attention_layernorm.weight"
@@ -324,17 +355,57 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         weight_map["norm.weight"] = "model.norm.weight"
         weight_map["head.weight"] = "lm_head.weight"
         
+        def dequantize_fp8_block(w_fp8: torch.Tensor, scale: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+            """Dequantize FP8 E4M3 weights with E8M0 block-wise scales."""
+            out_dim, in_dim = w_fp8.shape
+            w = w_fp8.to(torch.float32)
+            s = scale.to(torch.float32)
+            
+            # Repeat scale blocks
+            s = s.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+            s = s[:out_dim, :in_dim]
+            
+            return (w * s).to(torch.bfloat16)
+        
         for name, loaded_weight in weights:
-            # Skip multimodal and unused components
-            if any(skip in name for skip in ["vision.", "aligner.", "mtp.", "image_", ".scale"]):
+            # Skip multimodal and metadata
+            if any(skip in name for skip in [
+                "vision.", "aligner.", "mtp.", "image_", "hc_", 
+                ".scale", "experts."  # Phase 1: skip routed experts
+            ]):
                 continue
             
-            # Map checkpoint name to model parameter
             if name in weight_map:
                 param_name = weight_map[name]
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    # Handle FP8 dequantization
+                    
+                    # FP8 dequantization
                     if loaded_weight.dtype == torch.float8_e4m3fn:
-                        loaded_weight = loaded_weight.to(torch.bfloat16)
+                        if name in scale_cache:
+                            loaded_weight = dequantize_fp8_block(loaded_weight, scale_cache[name])
+                        else:
+                            loaded_weight = loaded_weight.to(torch.bfloat16)
+                    
+                    # TP sharding for specific weights
+                    if "wq_b.weight" in param_name or "wo_a.weight" in param_name:
+                        # Shard along output dimension
+                        tp_rank = get_tensor_model_parallel_rank()
+                        tp_size = get_tensor_model_parallel_world_size()
+                        shard_size = loaded_weight.shape[0] // tp_size
+                        loaded_weight = loaded_weight[tp_rank * shard_size:(tp_rank + 1) * shard_size]
+                    elif "wo_b.weight" in param_name:
+                        # Shard along input dimension
+                        tp_rank = get_tensor_model_parallel_rank()
+                        tp_size = get_tensor_model_parallel_world_size()
+                        shard_size = loaded_weight.shape[1] // tp_size
+                        loaded_weight = loaded_weight[:, tp_rank * shard_size:(tp_rank + 1) * shard_size]
+                    
+                    # Handle attn_sink: checkpoint is [64], model is [64/TP]
+                    if "attn_sink" in param_name:
+                        tp_rank = get_tensor_model_parallel_rank()
+                        tp_size = get_tensor_model_parallel_world_size()
+                        shard_size = loaded_weight.shape[0] // tp_size
+                        loaded_weight = loaded_weight[tp_rank * shard_size:(tp_rank + 1) * shard_size]
+                    
                     param.data.copy_(loaded_weight)
