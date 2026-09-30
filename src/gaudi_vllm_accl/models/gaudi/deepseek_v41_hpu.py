@@ -9,17 +9,23 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mla import MLAAttention
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_gaudi.attention.backends.hpu_attn import HPUAttentionMetadata
 
 from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
 
 
-class DeepseekV41Attention(nn.Module):
+class DeepseekV41Attention(MLAAttention):
     """Phase 1: Correct MLA architecture - wq_a and wkv are separate."""
     
     def __init__(
@@ -28,15 +34,24 @@ class DeepseekV41Attention(nn.Module):
         layer_idx: int,
         cache_config: Optional[CacheConfig] = None,
         prefix: str = "",
+        vllm_config: Optional[VllmConfig] = None,
     ):
-        super().__init__()
+        nn.Module.__init__(self)
         self.layer_idx = layer_idx
+        self.prefix = prefix
+        # 注册到 static_forward_context，让 vLLM 能遍历到
+        if vllm_config is not None and prefix:
+            compilation_config = vllm_config.compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim  # 512 = nope(448) + rope(64)
+        self.head_size = self.head_dim  # alias expected by vllm_gaudi MLAAttention isinstance branch
         self.rope_head_dim = config.qk_rope_head_dim  # 64
         self.nope_head_dim = self.head_dim - self.rope_head_dim  # 448
-        self.v_head_dim = config.v_head_dim  # 512
+        self.v_head_dim = config.head_dim  # MLA: v_head_dim == head_dim == 512
         self.q_lora_rank = config.q_lora_rank  # 1280
         self.num_kv_heads = config.num_key_value_heads  # 1
         
@@ -60,8 +75,8 @@ class DeepseekV41Attention(nn.Module):
         self.wq_b = nn.Linear(self.q_lora_rank, self.num_local_heads * self.head_dim, bias=False)
         
         # O projection (LoRA style with groups)
-        self.o_lora_rank = config.o_lora_rank  # 1024
-        self.o_groups = config.o_groups  # 8
+        self.o_lora_rank = getattr(config, 'o_lora_rank', 1024)
+        self.o_groups = getattr(config, 'o_groups', 8)
         assert self.o_groups % tp_size == 0
         self.num_local_groups = self.o_groups // tp_size
         
@@ -74,7 +89,7 @@ class DeepseekV41Attention(nn.Module):
             self.num_local_groups * self.o_lora_rank, 
             bias=False
         )
-        self.wo_b = nn.Linear(self.o_groups * self.o_lora_rank, self.hidden_size, bias=False)
+        self.wo_b = nn.Linear(self.num_local_groups * self.o_lora_rank, self.hidden_size, bias=False)
         
         # Attention sink: [num_local_heads] per-head scalars
         self.attn_sink = nn.Parameter(torch.zeros(self.num_local_heads))
@@ -91,13 +106,45 @@ class DeepseekV41Attention(nn.Module):
             is_neox_style=False,
         )
     
+    def get_attn_backend(self):
+        """AttentionLayerBase abstract method."""
+        from vllm_gaudi.attention.backends.hpu_attn import HPUMLAAttentionBackend
+        return HPUMLAAttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        """Phase 1.1: minimal spec; attention maintains its own KV cache."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        try:
+            with open("/tmp/dsv41_debug.log", "a") as _f:
+                _f.write("[DSV41] get_kv_cache_spec -> FullAttentionSpec" + chr(10))
+        except Exception:
+            pass
+        return FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=vllm_config.model_config.dtype,
+        )
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Phase 1: our layer manages its own weights; skip MLAAttention real post-load step."""
+        pass
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: HPUAttentionMetadata,
     ) -> torch.Tensor:
+        from vllm.forward_context import get_forward_context
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata.get(self.prefix)
+
+        # Phase 1: flatten any leading batch/seq dims to handle both [T,H] and [B,S,H] inputs
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])  # -> [num_tokens, hidden_size]
+        positions = positions.view(-1)  # -> [num_tokens]
+
         # Separate projections
         qr = self.wq_a(hidden_states)  # [T, 1280]
         kv = self.wkv(hidden_states)   # [T, 512]
@@ -107,8 +154,8 @@ class DeepseekV41Attention(nn.Module):
         kv = self.kv_norm(kv)  # [T, 512]
         
         # Q projection
-        q = self.wq_b(qr)  # [T, num_local_heads * 512]
-        q = q.view(-1, self.num_local_heads, self.head_dim)  # [T, 64/TP, 512]
+        q = self.wq_b(qr)  # [T, num_local_heads * head_dim]
+        q = q.view(-1, self.num_local_heads, self.head_dim)  # [T, 8, 512]
         
         # KV: replicate to all heads (num_kv_heads=1)
         kv = kv.unsqueeze(1).expand(-1, self.num_local_heads, -1)  # [T, 64/TP, 512]
@@ -116,19 +163,19 @@ class DeepseekV41Attention(nn.Module):
         # RoPE: apply to the LAST 64 dims [448:512]
         q_nope = q[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
         q_rope = q[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
-        q_rope = self.rotary_emb(positions, q_rope)
-        q = torch.cat([q_nope, q_rope], dim=-1)  # [T, 64/TP, 512]
         
         k_nope = kv[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
         k_rope = kv[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
-        k_rope = self.rotary_emb(positions, k_rope)
+        
+        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        q = torch.cat([q_nope, q_rope], dim=-1)  # [T, 64/TP, 512]
         k = torch.cat([k_nope, k_rope], dim=-1)  # [T, 64/TP, 512]
         
         # V: same as kv (for Phase 1, v_head_dim == head_dim == 512)
         v = kv  # [T, 64/TP, 512]
         
         # Attention
-        attn_output = self._simple_attention(q, k, v, kv_cache, attn_metadata)  # [T, 64/TP, 512]
+        attn_output = self._simple_attention(q, k, v, attn_metadata)  # [T, 64/TP, 512]
         
         # Inverse RoPE on output (optional for Phase 1, can skip)
         # o_nope = attn_output[:, :, :self.nope_head_dim]
@@ -139,9 +186,11 @@ class DeepseekV41Attention(nn.Module):
         # Output projection
         attn_output = attn_output.contiguous().view(-1, self.num_local_heads * self.v_head_dim)  # [T, 4096] when TP=8
         out = self.wo_a(attn_output)  # [T, 1024] when TP=8
-        out = tensor_model_parallel_all_reduce(out)  # [T, 1024]
         out = self.wo_b(out)  # [T, 5120]
+        out = tensor_model_parallel_all_reduce(out)  # [T, 1024]
         
+        # Restore original leading shape
+        out = out.view(*orig_shape[:-1], out.shape[-1])
         return out
     
     def _simple_attention(
@@ -149,18 +198,27 @@ class DeepseekV41Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: HPUAttentionMetadata,
+        attn_metadata: Optional[HPUAttentionMetadata],
     ) -> torch.Tensor:
-        """Phase 1: Simple PyTorch attention without PagedAttention."""
-        # q, k, v: [tokens, num_local_heads, dim]
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [T, H, T]
-        
-        # Add attn_sink: [num_local_heads] -> broadcast to [1, H, 1]
-        attn_weights = attn_weights + self.attn_sink.view(1, -1, 1)
-        
+        """Phase 1: Simple PyTorch attention with causal mask, no PagedAttention."""
+        # q, k, v: [T, H, D]  →  transpose to [H, T, D]
+        q = q.transpose(0, 1)   # [H, T, D]
+        k = k.transpose(0, 1)   # [H, T, D]
+        v = v.transpose(0, 1)   # [H, T, D]
+
+        T = q.shape[1]
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [H, T, T]
+
+        causal_mask = torch.triu(
+            torch.full((T, T), float("-inf"), device=q.device, dtype=attn_weights.dtype),
+            diagonal=1,
+        )
+        attn_weights = attn_weights + causal_mask  # [H, T, T]
+        attn_weights = attn_weights + self.attn_sink.view(-1, 1, 1)  # [H, 1, 1] broadcast
+
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)  # [T, H, D]
+        attn_output = torch.matmul(attn_weights, v)  # [H, T, D]
+        attn_output = attn_output.transpose(0, 1)   # [T, H, D]
         return attn_output
 
 
@@ -181,6 +239,8 @@ class DeepseekV41MoE(nn.Module):
         self.w3 = nn.Linear(self.hidden_size, self.moe_intermediate_size, bias=False)
         self.act_fn = SiluAndMul()
     
+
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Phase 1: Only use shared experts
         x1 = self.w1(hidden_states)
@@ -198,11 +258,14 @@ class DeepseekV41DecoderLayer(nn.Module):
         layer_idx: int,
         cache_config: Optional[CacheConfig] = None,
         prefix: str = "",
+        vllm_config: Optional[VllmConfig] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = DeepseekV41Attention(
-            config, layer_idx, cache_config, prefix=f"{prefix}.self_attn"
+            config, layer_idx, cache_config,
+            prefix=f"{prefix}.self_attn",
+            vllm_config=vllm_config,
         )
         self.mlp = DeepseekV41MoE(config, layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -212,8 +275,6 @@ class DeepseekV41DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: HPUAttentionMetadata,
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -222,7 +283,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         
-        hidden_states = self.self_attn(positions, hidden_states, kv_cache, attn_metadata)
+        hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         
@@ -243,11 +304,18 @@ class DeepseekV41Model(nn.Module):
         self.end_layer = config.num_hidden_layers
         self.layers = nn.ModuleList([
             DeepseekV41DecoderLayer(
-                config, i, cache_config, prefix=f"{prefix}.layers.{i}"
+                config, i, cache_config,
+                prefix=f"{prefix}.layers.{i}",
+                vllm_config=vllm_config,
             )
             for i in range(self.start_layer, self.end_layer)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        with open("/tmp/dsv41_debug.log", "a") as _f:
+            _ctx = vllm_config.compilation_config.static_forward_context
+            _f.write(f"[DSV41] Model.__init__ done, ctx has {len(_ctx)} entries\n")
+            for _k in list(_ctx.keys())[:8]:
+                _f.write(f"[DSV41]   ctx[{_k}] = {type(_ctx[_k]).__name__}\n")
     
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -256,8 +324,6 @@ class DeepseekV41Model(nn.Module):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: HPUAttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ):
@@ -271,7 +337,7 @@ class DeepseekV41Model(nn.Module):
         
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
-                positions, hidden_states, kv_caches[i], attn_metadata, residual
+                positions, hidden_states, residual
             )
         
         if not get_pp_group().is_last_rank:
@@ -293,7 +359,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         self.config = config
         self.vllm_config = vllm_config
         self.model = DeepseekV41Model(vllm_config=vllm_config, prefix=f"{prefix}.model")
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=None,
+            prefix=f"{prefix}.lm_head",
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
     
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -302,24 +374,27 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: HPUAttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ):
         hidden_states = self.model(
-            input_ids, positions, kv_caches, attn_metadata, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds
         )
         if isinstance(hidden_states, IntermediateTensors):
             return hidden_states
         return hidden_states
     
-    def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
     
+
     def load_weights(self, weights):
         """Load weights from checkpoint with FP8 dequantization."""
+        weights = list(weights)   # FIX: weights 是生成器，必须缓存成 list，否则第二次遍历为空
         params_dict = dict(self.named_parameters())
         
         # Cache all .scale tensors for FP8 dequantization
@@ -354,6 +429,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         weight_map["embed.weight"] = "model.embed_tokens.weight"
         weight_map["norm.weight"] = "model.norm.weight"
         weight_map["head.weight"] = "lm_head.weight"
+
+        loaded = 0
+        shape_bad = 0
         
         def dequantize_fp8_block(w_fp8: torch.Tensor, scale: torch.Tensor, block_size: int = 32) -> torch.Tensor:
             """Dequantize FP8 E4M3 weights with E8M0 block-wise scales."""
@@ -408,4 +486,15 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                         shard_size = loaded_weight.shape[0] // tp_size
                         loaded_weight = loaded_weight[tp_rank * shard_size:(tp_rank + 1) * shard_size]
                     
-                    param.data.copy_(loaded_weight)
+                    # lm_head is a ParallelLMHead: use its weight_loader for vocab-dim sharding
+                    if param_name == "lm_head.weight":
+                        self.lm_head.weight_loader(param, loaded_weight)
+                    else:
+                        if tuple(param.shape) != tuple(loaded_weight.shape):
+                            shape_bad += 1
+                            print(f"SHAPE MISMATCH {param_name}: param={tuple(param.shape)} vs ckpt={tuple(loaded_weight.shape)}")
+                            continue
+                        param.data.copy_(loaded_weight)
+                        loaded += 1
+
+        print(f"[LOAD] loaded={loaded} shape_bad={shape_bad}")

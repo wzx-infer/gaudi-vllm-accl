@@ -51,6 +51,63 @@ def _check_vllm_version() -> None:
     logger.info(f"vLLM version check passed: {installed_version}")
 
 
+def _patch_is_deepseek_mla() -> None:
+    """Make vLLM recognize deepseek_v41/deepseek_v41_text as an MLA model.
+
+    vLLM's ModelArchConfigConvertorBase.is_deepseek_mla() only checks a
+    hardcoded allowlist of model_type strings. DeepSeek V4.1 Flash uses
+    model_type="deepseek_v41" (text_config model_type="deepseek_v41_text"),
+    which is not in that list, so model_config.use_mla resolves to False and
+    vllm_gaudi's initialize_kv_cache allocates a full (non-MLA) key+value
+    cache per layer instead of the compact MLA cache, doubling KV cache
+    memory and causing device OOM. Patch the check here instead of editing
+    vLLM source.
+
+    register() runs while vllm.transformers_utils.model_arch_config_convertor
+    is still mid-import (circular import), so importing it eagerly here
+    fails. Defer the actual patch application via importlib hook: patch it
+    lazily the first time vllm.config.model is imported/used, by which point
+    the circular import has fully resolved.
+    """
+    import sys
+
+    def _apply(macc_module) -> None:
+        if getattr(macc_module.ModelArchConfigConvertorBase, "_gaudi_accl_patched", False):
+            return
+        _orig = macc_module.ModelArchConfigConvertorBase.is_deepseek_mla
+
+        def _patched_is_deepseek_mla(self) -> bool:
+            model_type = getattr(self.hf_text_config, "model_type", None)
+            if model_type in ("deepseek_v41", "deepseek_v41_text"):
+                return getattr(self.hf_text_config, "head_dim", None) is not None
+            return _orig(self)
+
+        macc_module.ModelArchConfigConvertorBase.is_deepseek_mla = _patched_is_deepseek_mla
+        macc_module.ModelArchConfigConvertorBase._gaudi_accl_patched = True
+        logger.info("Patched is_deepseek_mla to recognize deepseek_v41")
+
+    mod_name = "vllm.transformers_utils.model_arch_config_convertor"
+    existing = sys.modules.get(mod_name)
+    if existing is not None and hasattr(existing, "ModelArchConfigConvertorBase"):
+        _apply(existing)
+        return
+
+    import importlib.abc
+    import importlib.util
+
+    class _MLAPatchFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        def find_module(self, fullname, path=None):
+            return self if fullname == mod_name else None
+
+        def load_module(self, fullname):
+            sys.meta_path.remove(self)
+            module = importlib.import_module(fullname)
+            _apply(module)
+            return module
+
+    sys.meta_path.insert(0, _MLAPatchFinder())
+
+
 def register() -> None:
     """Main plugin registration function called by vLLM."""
     import sys as _sys; print("[register] called", file=_sys.stderr, flush=True)
@@ -58,6 +115,9 @@ def register() -> None:
 
     # Step 0: Verify vLLM version before any registration
     _check_vllm_version()
+
+    # Step 1: Patch MLA detection so use_mla=True for our model
+    _patch_is_deepseek_mla()
 
     # Part A: Register Transformers config (MUST be first)
     _register_transformers_config()
@@ -108,7 +168,7 @@ def _register_models() -> None:
         # Use string format to avoid CUDA initialization on import
         ModelRegistry.register_model(
             "DeepseekV41ForCausalLM",
-            "gaudi_vllm_accl.models.gaudi.deepseek_v41_hpa:DeepseekV41ForCausalLM"
+            "gaudi_vllm_accl.models.gaudi.deepseek_v41_hpu:DeepseekV41ForCausalLM"
         )
         import sys as _s; print("[register] model registered OK", file=_s.stderr, flush=True)
         logger.info("Registered model: DeepseekV41ForCausalLM")
