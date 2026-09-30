@@ -85,14 +85,14 @@ class DeepseekV41Attention(MLAAttention):
         # Output: [num_local_groups * o_lora_rank] = [1 * 1024] = [1024] when TP=8
         #         or [8 * 1024] = [8192] when TP=1
         self.wo_a = nn.Linear(
-            self.num_local_heads * self.v_head_dim, 
-            self.num_local_groups * self.o_lora_rank, 
+            self.num_heads * self.v_head_dim, 
+            self.o_groups * self.o_lora_rank, 
             bias=False
         )
         self.wo_b = nn.Linear(self.num_local_groups * self.o_lora_rank, self.hidden_size, bias=False)
         
         # Attention sink: [num_local_heads] per-head scalars
-        self.attn_sink = nn.Parameter(torch.zeros(self.num_local_heads))
+        self.attn_sink = nn.Parameter(torch.zeros(self.num_heads))
         
         # RoPE
         rope_params = getattr(config, "rope_parameters", None) or {}
@@ -154,8 +154,12 @@ class DeepseekV41Attention(MLAAttention):
         kv = self.kv_norm(kv)  # [T, 512]
         
         # Q projection
-        q = self.wq_b(qr)  # [T, num_local_heads * head_dim]
-        q = q.view(-1, self.num_local_heads, self.head_dim)  # [T, 8, 512]
+        q = self.wq_b(qr)  # [T, num_heads * head_dim]
+        q = q.view(-1, self.num_heads, self.head_dim)  # [T, 64, 512]
+        # TP slice to local heads
+        tp_rank_attn = get_tensor_model_parallel_rank()
+        head_start = tp_rank_attn * self.num_local_heads
+        q = q[:, head_start:head_start + self.num_local_heads, :]  # [T, 8, 512]
         
         # KV: replicate to all heads (num_kv_heads=1)
         kv = kv.unsqueeze(1).expand(-1, self.num_local_heads, -1)  # [T, 64/TP, 512]
@@ -184,7 +188,8 @@ class DeepseekV41Attention(MLAAttention):
         # attn_output = torch.cat([o_nope, o_rope], dim=-1)
         
         # Output projection
-        attn_output = attn_output.contiguous().view(-1, self.num_local_heads * self.v_head_dim)  # [T, 4096] when TP=8
+        attn_output = attn_output.contiguous().view(-1, self.num_local_heads * self.v_head_dim)  # [T, 4096]
+        attn_output = tensor_model_parallel_all_gather(attn_output, dim=-1)  # [T, 32768]
         out = self.wo_a(attn_output)  # [T, 1024] when TP=8
         out = self.wo_b(out)  # [T, 5120]
         out = tensor_model_parallel_all_reduce(out)  # [T, 1024]

@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+gaudi_vllm_accl = gaudi_vllm_accl.register:register
