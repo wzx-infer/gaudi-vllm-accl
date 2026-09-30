@@ -24,7 +24,6 @@ from vllm_gaudi.attention.backends.hpu_attn import HPUAttentionMetadata
 
 from gaudi_vllm_accl.models.deepseek_v41_flash import DeepSeekV41Config
 
-
 class DeepseekV41Attention(MLAAttention):
     """Phase 1: Correct MLA architecture - wq_a and wkv are separate."""
     
@@ -85,14 +84,15 @@ class DeepseekV41Attention(MLAAttention):
         # Output: [num_local_groups * o_lora_rank] = [1 * 1024] = [1024] when TP=8
         #         or [8 * 1024] = [8192] when TP=1
         self.wo_a = nn.Linear(
-            self.num_heads * self.v_head_dim, 
-            self.o_groups * self.o_lora_rank, 
+            self.num_local_heads * self.v_head_dim,
+            self.num_local_groups * self.o_lora_rank,
             bias=False
         )
         self.wo_b = nn.Linear(self.num_local_groups * self.o_lora_rank, self.hidden_size, bias=False)
-        
+
         # Attention sink: [num_local_heads] per-head scalars
-        self.attn_sink = nn.Parameter(torch.zeros(self.num_heads))
+        self.attn_sink = nn.Parameter(torch.zeros(self.num_local_heads))
+
         
         # RoPE
         rope_params = getattr(config, "rope_parameters", None) or {}
@@ -154,22 +154,18 @@ class DeepseekV41Attention(MLAAttention):
         kv = self.kv_norm(kv)  # [T, 512]
         
         # Q projection
-        q = self.wq_b(qr)  # [T, num_heads * head_dim]
-        q = q.view(-1, self.num_heads, self.head_dim)  # [T, 64, 512]
-        # TP slice to local heads
-        tp_rank_attn = get_tensor_model_parallel_rank()
-        head_start = tp_rank_attn * self.num_local_heads
-        q = q[:, head_start:head_start + self.num_local_heads, :]  # [T, 8, 512]
+        q = self.wq_b(qr)  # [T, num_local_heads * head_dim]  (already TP-sharded on output)
+        q = q.view(-1, self.num_local_heads, self.head_dim)  # [T, 8, 512]
         
         # KV: replicate to all heads (num_kv_heads=1)
         kv = kv.unsqueeze(1).expand(-1, self.num_local_heads, -1)  # [T, 64/TP, 512]
         
         # RoPE: apply to the LAST 64 dims [448:512]
         q_nope = q[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
-        q_rope = q[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
+        q_rope = q[:, :, self.nope_head_dim:].contiguous()  # [T, 64/TP, 64]
         
         k_nope = kv[:, :, :self.nope_head_dim]  # [T, 64/TP, 448]
-        k_rope = kv[:, :, self.nope_head_dim:]  # [T, 64/TP, 64]
+        k_rope = kv[:, :, self.nope_head_dim:].contiguous()  # [T, 64/TP, 64]
         
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
         q = torch.cat([q_nope, q_rope], dim=-1)  # [T, 64/TP, 512]
@@ -189,10 +185,9 @@ class DeepseekV41Attention(MLAAttention):
         
         # Output projection
         attn_output = attn_output.contiguous().view(-1, self.num_local_heads * self.v_head_dim)  # [T, 4096]
-        attn_output = tensor_model_parallel_all_gather(attn_output, dim=-1)  # [T, 32768]
-        out = self.wo_a(attn_output)  # [T, 1024] when TP=8
+        out = self.wo_a(attn_output)  # [T, 8192]
         out = self.wo_b(out)  # [T, 5120]
-        out = tensor_model_parallel_all_reduce(out)  # [T, 1024]
+        out = tensor_model_parallel_all_reduce(out)  # partial-sum across TP ranks
         
         # Restore original leading shape
         out = out.view(*orig_shape[:-1], out.shape[-1])
@@ -207,25 +202,37 @@ class DeepseekV41Attention(MLAAttention):
     ) -> torch.Tensor:
         """Phase 1: Simple PyTorch attention with causal mask, no PagedAttention."""
         # q, k, v: [T, H, D]  →  transpose to [H, T, D]
-        q = q.transpose(0, 1)   # [H, T, D]
-        k = k.transpose(0, 1)   # [H, T, D]
-        v = v.transpose(0, 1)   # [H, T, D]
+        q = q.transpose(0, 1)   # [H, Tq, D]
+        k = k.transpose(0, 1)   # [H, Tk, D]
+        v = v.transpose(0, 1)   # [H, Tk, D]
 
-        T = q.shape[1]
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [H, T, T]
+        Tq = q.shape[1]
+        Tk = k.shape[1]
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling  # [H, Tq, Tk]
 
-        causal_mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=q.device, dtype=attn_weights.dtype),
-            diagonal=1,
-        )
-        attn_weights = attn_weights + causal_mask  # [H, T, T]
-        attn_weights = attn_weights + self.attn_sink.view(-1, 1, 1)  # [H, 1, 1] broadcast
+        if Tq == Tk:
+            causal_mask = torch.triu(
+                torch.full((Tq, Tk), float("-inf"), device=q.device, dtype=attn_weights.dtype),
+                diagonal=1,
+            )
+        else:
+            row_pos = torch.arange(Tk - Tq, Tk, device=q.device)
+            col_pos = torch.arange(Tk, device=q.device)
+            causal_mask = torch.where(
+                col_pos[None, :] <= row_pos[:, None],
+                torch.zeros((), device=q.device, dtype=attn_weights.dtype),
+                torch.full((), float("-inf"), device=q.device, dtype=attn_weights.dtype),
+            )
+        attn_weights = attn_weights + causal_mask
+        sink = self.attn_sink
+        if sink.numel() != attn_weights.shape[0]:
+            sink = sink[: attn_weights.shape[0]]
+        attn_weights = attn_weights + sink.view(-1, 1, 1)
 
         attn_weights = torch.softmax(attn_weights, dim=-1)
         attn_output = torch.matmul(attn_weights, v)  # [H, T, D]
         attn_output = attn_output.transpose(0, 1)   # [T, H, D]
         return attn_output
-
 
 class DeepseekV41MoE(nn.Module):
     """Phase 1: Only shared experts, no routed experts."""
@@ -245,7 +252,6 @@ class DeepseekV41MoE(nn.Module):
         self.act_fn = SiluAndMul()
     
 
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Phase 1: Only use shared experts
         x1 = self.w1(hidden_states)
@@ -254,7 +260,6 @@ class DeepseekV41MoE(nn.Module):
         x = self.act_fn(gate_up)
         x = self.w2(x)
         return x
-
 
 class DeepseekV41DecoderLayer(nn.Module):
     def __init__(
@@ -293,7 +298,6 @@ class DeepseekV41DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         
         return hidden_states, residual
-
 
 class DeepseekV41Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -350,7 +354,6 @@ class DeepseekV41Model(nn.Module):
         
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
 
 class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
     is_text_generation_model = True
