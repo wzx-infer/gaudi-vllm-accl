@@ -3,3 +3,7 @@
 *.bak_*
 __pycache__/
 *.pyc
+*.egg-info/
+__pycache__/
+*.pyc
+*.bak*
